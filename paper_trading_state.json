@@ -12,5 +12,6 @@
   "last_morning_report_date": "2026-11-17",
   "cost_basis": 0.0,
   "last_dip_alert_ts": 0.0,
-  "last_dip_alert_candle_ms": 0
+  "last_dip_alert_candle_ms": 0,
+  "notify_next_5m_close": true
 }
