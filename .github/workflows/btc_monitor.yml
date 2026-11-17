@@ -5,6 +5,11 @@ on:
     # Run every 5 minutes (aligned with 5m candle closes; unlimited free minutes on public repo)
     - cron: '*/5 * * * *'
   workflow_dispatch: # Allows manual trigger anytime from GitHub Web
+    inputs:
+      notify_status:
+        description: 'Send 5m candle close status report to Telegram'
+        required: false
+        default: 'false'
 
 concurrency:
   group: btc-cloud-monitor
@@ -28,6 +33,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          NOTIFY_STATUS: ${{ github.event.inputs.notify_status }}
         run: |
           python cloud_bot.py
 

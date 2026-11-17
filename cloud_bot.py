@@ -15,6 +15,7 @@ from paper_trader import (
     check_dip_alert,
     check_sma_touch_alert,
     evaluate_signal_and_step,
+    get_dip_status_text,
     load_config,
     load_state,
     save_state,
@@ -67,6 +68,19 @@ def run_cloud_monitor(state_path=STATE_PATH):
     elif isinstance(dip_info, dict) and dip_info.get("skipped_reason"):
         suffix = " | exit_settled=True" if dip_info.get("exit_settled") else ""
         print(f"Cash-Only 2h Dip Monitor skipped: {dip_info['skipped_reason']}{suffix}")
+
+    # 1c. Optional one-shot 5m close status notification (via workflow_dispatch input or state flag)
+    want_status_once = (
+        os.environ.get("NOTIFY_STATUS", "").strip().lower() in ("1", "true", "yes")
+        or bool(state.get("notify_next_5m_close"))
+    )
+    if want_status_once:
+        status_msg = "<b>☁️ [GitHub 클라우드 봇 · 5분봉 마감 점검 리포트]</b>\n\n" + get_dip_status_text(config, state)
+        if send_telegram_message(config.get("bot_token"), config.get("chat_id"), status_msg):
+            print("Sent 5m candle close status report to Telegram!")
+            if state.get("notify_next_5m_close"):
+                state["notify_next_5m_close"] = False
+                save_state(state, state_path=state_path)
 
     # 2. Closed UTC Daily Candle Strategy Evaluation & Execution (once per closed day)
     state, eval_info = evaluate_signal_and_step(config, state, manual_check=False, state_path=state_path)
