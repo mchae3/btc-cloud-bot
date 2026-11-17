@@ -1,0 +1,16 @@
+{
+  "initial_seed": 10000.0,
+  "cash": 10000.0,
+  "btc_qty": 0.0,
+  "position": "CASH",
+  "entry_price": 0.0,
+  "entry_time_utc": "",
+  "last_evaluated_candle_ms": 1794787200000,
+  "trades": [],
+  "last_signal": "CASH",
+  "last_touch_alerts": {},
+  "last_morning_report_date": "2026-11-17",
+  "cost_basis": 0.0,
+  "last_dip_alert_ts": 0.0,
+  "last_dip_alert_candle_ms": 0
+}
