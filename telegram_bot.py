@@ -31,6 +31,7 @@ from paper_trader import (
     save_state,
     send_telegram_message,
     summarize_dip_ledger,
+    sync_state_from_cloud,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -152,6 +153,7 @@ def main():
     offset = None
     last_touch_check_ts = 0.0
     last_daily_attempt_ts = 0.0
+    last_cloud_sync_ts = 0.0
 
     while True:
         try:
@@ -159,22 +161,35 @@ def main():
             state = load_state(config)
             now_ts = time.time()
             now_utc = datetime.now(timezone.utc)
+            cloud_primary = bool(config.get("cloud_bot_primary", True))
 
-            # 1. Real-time SMA Touch & Idle-Cash 2h Dip Check (Every 30 seconds; scan last 6 closed 5m bars = 30m sleep catch-up)
-            if now_ts - last_touch_check_ts >= 30:
+            # Periodically sync state from 24/7 GitHub Cloud Bot so local state never drifts or double-sends
+            if now_ts - last_cloud_sync_ts >= 30:
+                last_cloud_sync_ts = now_ts
+                sync_state_from_cloud(state)
+
+            # 1. Real-time SMA Touch & Idle-Cash 2h Dip Check
+            # When cloud_bot_primary is True, GitHub Actions (*/5 * * * *) handles scheduled push alerts;
+            # local daemon only runs autonomous push checks when cloud_bot_primary is False.
+            if not cloud_primary and (now_ts - last_touch_check_ts >= 30):
                 last_touch_check_ts = now_ts
                 check_sma_touch_alert(config, state)
                 check_dip_alert(config, state, scan_bars=6)
 
-            # 2. Catch-up safe daily evaluation after UTC 00:00:10 (retried at most every 60s if API fails)
-            if should_run_daily_evaluation(now_utc, state.get("last_evaluated_candle_ms", 0)):
+            # 2. Catch-up safe daily evaluation (waits until 00:12 UTC when cloud_primary is True so GitHub Actions sends once at 00:00~00:05 UTC)
+            daily_ready = (not cloud_primary) or (now_utc.hour > 0 or now_utc.minute >= 12)
+            if daily_ready and should_run_daily_evaluation(now_utc, state.get("last_evaluated_candle_ms", 0)):
                 if now_ts - last_daily_attempt_ts >= 60:
                     last_daily_attempt_ts = now_ts
-                    print(f"[{now_utc.isoformat()}] Closed UTC daily candle detected. Evaluating Model C signal...")
-                    state, info = evaluate_signal_and_step(config, state, manual_check=False)
+                    sync_state_from_cloud(state)
+                    if should_run_daily_evaluation(now_utc, state.get("last_evaluated_candle_ms", 0)):
+                        print(f"[{now_utc.isoformat()}] Closed UTC daily candle detected. Evaluating Model C signal...")
+                        state, info = evaluate_signal_and_step(config, state, manual_check=False)
 
             # 3. Poll for incoming user commands
             updates = get_telegram_updates(token, offset)
+            if updates:
+                sync_state_from_cloud(state)
             for upd in updates:
                 offset = upd["update_id"] + 1
                 msg = upd.get("message")

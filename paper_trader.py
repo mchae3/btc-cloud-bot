@@ -178,6 +178,78 @@ def save_state(state, state_path=STATE_PATH):
     _atomic_write_json(state_path, state)
 
 
+CLOUD_STATE_RAW_URL = "https://raw.githubusercontent.com/mchae3/btc-cloud-bot/main/paper_trading_state.json"
+
+
+def sync_state_from_cloud(state, state_path=STATE_PATH, url=CLOUD_STATE_RAW_URL, timeout=4):
+    """Merge newer state fields from the GitHub Actions 24/7 cloud bot to prevent split-brain/duplicate alerts."""
+    if not url or not isinstance(state, dict):
+        return False
+    try:
+        sep = "&" if "?" in url else "?"
+        req = urllib.request.Request(
+            f"{url}{sep}_ts={int(time.time())}",
+            headers={"User-Agent": "BTCQuantLab-StateSync/1.0", "Cache-Control": "no-cache"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout, context=_get_ssl_context()) as resp:
+            remote = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(remote, dict):
+            return False
+    except Exception:
+        return False
+
+    dirty = False
+    r_eval = int(remote.get("last_evaluated_candle_ms", 0) or 0)
+    l_eval = int(state.get("last_evaluated_candle_ms", 0) or 0)
+    r_trades = remote.get("trades") if isinstance(remote.get("trades"), list) else []
+    l_trades = state.get("trades") if isinstance(state.get("trades"), list) else []
+    if r_eval > l_eval or len(r_trades) > len(l_trades):
+        for k in ("last_evaluated_candle_ms", "position", "cash", "btc_qty", "cost_basis", "entry_price", "entry_time_utc", "trades", "last_signal"):
+            if k in remote and state.get(k) != remote[k]:
+                state[k] = remote[k]
+                dirty = True
+
+    r_morn = str(remote.get("last_morning_report_date", "") or "")
+    l_morn = str(state.get("last_morning_report_date", "") or "")
+    if r_morn > l_morn:
+        state["last_morning_report_date"] = r_morn
+        dirty = True
+
+    r_dip_ms = int(remote.get("last_dip_alert_candle_ms", 0) or 0)
+    l_dip_ms = int(state.get("last_dip_alert_candle_ms", 0) or 0)
+    r_dip_trades = remote.get("dip_trades") if isinstance(remote.get("dip_trades"), list) else []
+    l_dip_trades = state.get("dip_trades") if isinstance(state.get("dip_trades"), list) else []
+    if (
+        r_dip_ms > l_dip_ms
+        or len(r_dip_trades) > len(l_dip_trades)
+        or (r_dip_ms == l_dip_ms and remote.get("open_dip") != state.get("open_dip") and r_dip_ms > 0)
+    ):
+        for k in ("last_dip_alert_candle_ms", "open_dip", "dip_trades", "dip_cash", "dip_initial_seed"):
+            if k in remote and state.get(k) != remote[k]:
+                state[k] = remote[k]
+                dirty = True
+        r_dip_ts = float(remote.get("last_dip_alert_ts", 0.0) or 0.0)
+        if r_dip_ts > float(state.get("last_dip_alert_ts", 0.0) or 0.0):
+            state["last_dip_alert_ts"] = r_dip_ts
+            dirty = True
+
+    r_touch = remote.get("last_touch_alerts")
+    if isinstance(r_touch, dict):
+        l_touch = state.setdefault("last_touch_alerts", {})
+        for k, v in r_touch.items():
+            try:
+                fv = float(v)
+                if fv > float(l_touch.get(k, 0.0) or 0.0):
+                    l_touch[k] = fv
+                    dirty = True
+            except (TypeError, ValueError):
+                pass
+
+    if dirty and state_path:
+        save_state(state, state_path=state_path)
+    return dirty
+
+
 def send_telegram_message(token, chat_id, text, parse_mode="HTML"):
     if not token or not chat_id:
         print(f"[Telegram Mock] (No token/chat_id configured):\n{text}")
@@ -751,20 +823,28 @@ def compute_short_dip_snapshot(closed_5m, lookback_bars=24, drop_pct=4.5, scan_b
     def _window_vol_ratio(idx, ref_bar):
         if idx + 1 < lookback_bars:
             return None
-        recent_vol = sum(float(c["volume"]) for c in closed_5m[idx - lookback_bars + 1:idx + 1])
         ref_open = int(ref_bar["open_time_ms"])
+        bar_open = int(closed_5m[idx]["open_time_ms"])
+        recent_slice = [
+            c for c in closed_5m[max(0, idx - lookback_bars + 1):idx + 1]
+            if ref_open < int(c["open_time_ms"]) <= bar_open
+        ]
+        if not recent_slice:
+            return None
+        recent_vol = sum(float(c["volume"]) for c in recent_slice)
+        eff_bars = float(len(recent_slice))
         base_vol = None
         if idx >= 4032 + lookback_bars:
             prior = closed_5m[idx - lookback_bars + 1 - 4032:idx - lookback_bars + 1]
-            base_vol = (sum(float(c["volume"]) for c in prior) / 4032.0) * lookback_bars
+            base_vol = (sum(float(c["volume"]) for c in prior) / 4032.0) * eff_bars
         elif closed_1h:
             hr_avg = _compute_1h_baseline_vol(closed_1h, ref_open, days=14)
             if hr_avg and hr_avg > 0:
-                base_vol = hr_avg * (lookback_bars / 12.0)
+                base_vol = hr_avg * (eff_bars / 12.0)
         else:
             prior_5m = closed_5m[:max(0, idx - lookback_bars + 1)]
             if len(prior_5m) >= 6:
-                base_vol = (sum(float(c["volume"]) for c in prior_5m) / float(len(prior_5m))) * lookback_bars
+                base_vol = (sum(float(c["volume"]) for c in prior_5m) / float(len(prior_5m))) * eff_bars
         if base_vol and base_vol > 0:
             return recent_vol / base_vol
         return None
