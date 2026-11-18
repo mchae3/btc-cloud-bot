@@ -17,6 +17,7 @@ from paper_trader import (
     check_dip_alert,
     check_sma_touch_alert,
     compute_live_signal_snapshot,
+    describe_position_action,
     evaluate_signal_and_step,
     fetch_binance_24h_ticker,
     fetch_binance_daily_candles,
@@ -125,51 +126,13 @@ def format_toronto_morning_preview(config, state):
     sma = snap["active_sma"]
     sma_len = snap["active_sma_len"]
     diff_active = (cur_p / sma - 1.0) * 100.0
-    reg_str = "준비 중"
-    if snap["regime_sma"] is not None:
-        diff_reg = (cur_p / snap["regime_sma"] - 1.0) * 100.0
-        reg_str = f"${snap['regime_sma']:,.2f} ({diff_reg:+.2f}%)"
+    badge, action_guide, cur_equity, total_ret, vol_mark = describe_position_action(state, snap, cur_p)
 
-    initial_seed = float(state.get("initial_seed", 10000.0))
-    cur_equity = float(state["cash"]) if prev_pos == "CASH" else float(state["btc_qty"]) * cur_p
-    total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
-    pos_str = "🟢 비트코인 100% 보유 (상승 추세)" if prev_pos == "BTC" else "⚪ USDT 100% 현금 (하락/휩소 방어 중)"
-
-    if prev_pos == "BTC":
-        guidance = f"현재 {sma_len}일선 위에서 안전하게 추세를 홀딩하고 있습니다. ({sma_len}일선 이탈 시 매도)"
-    elif snap["is_above"]:
-        guidance = (
-            f"가격이 {sma_len}일선 위에 있으나 거래량 배수({snap['vol_ratio']:.2f}배)가 "
-            f"{snap['regime_label']} 기준({snap['vol_mult']}배)에 미달하여 현금을 유지합니다."
-        )
-    else:
-        guidance = (
-            f"현재 {sma_len}일선 아래 구간({diff_active:+.2f}%)으로 현금 100% 보존 중입니다. "
-            f"{sma_len}일선 돌파 & 거래량 {snap['vol_mult']}배 충족 시 익일 시가 매수합니다."
-        )
-
-    vol_tag = f"🟢 {snap['vol_ratio']:.2f}배 ({snap['vol_mult']}배 충족)" if snap["vol_ok"] else f"⚪ {snap['vol_ratio']:.2f}배 ({snap['vol_mult']}배 미달)"
-
-    return f"""<b>🌅 [BTC Quant Lab 토론토 모닝 브리핑]</b>
-━━━━━━━━━━━━━━━━━━━━
-⏰ <b>토론토 시각:</b> {now_toronto.strftime('%Y-%m-%d %H:%M %Z')}
-• <b>전략:</b> {_strategy_display_name(config, snap)}
-• <b>장세 체제:</b> {snap['regime_label']}
-• <b>비트코인 현재가:</b> ${cur_p:,.2f} (24h: <b>{chg_24h:+.2f}%</b>)
-• <b>일봉 {sma_len}일선:</b> ${sma:,.2f} (괴리율: <b>{diff_active:+.2f}%</b>)
-• <b>일봉 {snap['regime_sma_len']}일선:</b> {reg_str}
-• <b>거래량 지표:</b> 직전 {snap['last_vol']:,.1f} BTC ({snap['vol_ma_len']}일 평균: {snap['prior_vol_avg']:,.1f} BTC)
-• <b>거래량 배수:</b> <b>{vol_tag}</b>
-━━━━━━━━━━━━━━━━━━━━
-💼 <b>모의투자 계좌 현황</b>
-• <b>현재 포지션:</b> <b>{pos_str}</b>
-• <b>가상 평가자산:</b> <b>${cur_equity:,.2f}</b>
-• <b>누적 모의수익률:</b> <b>{total_ret:+.2f}%</b> (초기 ${initial_seed:,.0f})
-━━━━━━━━━━━━━━━━━━━━
-💡 <b>오늘의 전략 가이드:</b>
-{guidance}
-
-좋은 하루 되세요! 🍁"""
+    return f"""<b>{badge} 아침 브리핑 ({now_toronto.strftime('%m/%d %H:%M %Z')})</b>
+• <b>행동:</b> {action_guide}
+• <b>현재가:</b> ${cur_p:,.0f} (24h <b>{chg_24h:+.2f}%</b> · {sma_len}일선 <b>{diff_active:+.2f}%</b>)
+• <b>거래량/장세:</b> {vol_mark} {snap['vol_ratio']:.2f}배(기준 {snap['vol_mult']}배) · {snap['regime_label']}
+• <b>잔고:</b> ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)"""
 
 
 def main():

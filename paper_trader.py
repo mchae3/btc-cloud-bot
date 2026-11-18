@@ -594,84 +594,66 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
     }
 
 
+def describe_position_action(state, snap, ref_price):
+    """Return shared (badge, action_guide, cur_equity, total_ret, vol_mark) for briefings/status."""
+    pos = state.get("position", "CASH")
+    initial_seed = float(state.get("initial_seed", 10000.0))
+    cur_equity = float(state["cash"]) if pos == "CASH" else float(state["btc_qty"]) * float(ref_price)
+    total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
+    sma = snap["active_sma"]
+    sma_len = snap["active_sma_len"]
+    has_dip = isinstance(state.get("open_dip"), dict)
+
+    if pos == "BTC":
+        badge = "🟢 [매수 유지 · 보유]"
+        action_guide = f"<b>관망(홀딩)</b> · {sma_len}일선(${sma:,.0f}) 이탈 시 매도"
+    elif has_dip:
+        badge = "🟢 [단타 보유 · 추세 관망]"
+        action_guide = f"2h 단타 진행 중 · 일봉 추세 <b>관망</b> (${sma:,.0f} 돌파+거래량 {snap['vol_mult']}배 대기)"
+    elif snap["is_above"]:
+        badge = "🟡 [관망 · 현금 대기]"
+        action_guide = f"<b>관망</b> · {sma_len}일선 위지만 거래량 부족({snap['vol_ratio']:.2f}/{snap['vol_mult']}배)"
+    else:
+        badge = "🟡 [관망 · 현금 대기]"
+        action_guide = f"<b>관망</b> · ${sma:,.0f} 돌파 + 거래량 {snap['vol_mult']}배 시 매수"
+
+    vol_mark = "✅" if snap["vol_ok"] else "➖"
+    return badge, action_guide, cur_equity, total_ret, vol_mark
+
+
 def format_trade_alert(config, state, trade, snap):
     action = trade["action"]
-    icon = "🚀" if "매수" in action else "🛡️"
+    is_buy = "매수" in action
+    header = "🟢 [매수] BTC 진입 완료" if is_buy else "🔴 [매도] 전량 현금화"
     cur_equity = float(state["cash"]) if state["position"] == "CASH" else float(state["btc_qty"]) * trade["price"]
     initial_seed = float(state.get("initial_seed", 10000.0))
     total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
-    reg_str = f"${snap['regime_sma']:,.2f}" if snap.get("regime_sma") is not None else "준비 중"
     promoted = trade.get("promoted_dip")
     promo_line = ""
     if isinstance(promoted, dict):
         promo_line = (
-            f"\n• <b>🔁 단타 추세 승계:</b> 보유 중이던 2h 단타(기준가 ${promoted['entry_ref_price']:,.2f}, "
-            f"전환 시점 {promoted['pnl_pct']:+.2f}%) 매도 없이 모델 C 추세로 자동 승계!"
+            f"\n• <b>단타 추세 승계:</b> 기존 2h 단타(${promoted['entry_ref_price']:,.0f} · "
+            f"{promoted['pnl_pct']:+.2f}%) 매도 없이 홀딩 연결"
         )
 
-    msg = f"""<b>{icon} [BTC Quant Lab 실시간 모의매매 신호 체결]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>전략:</b> {_strategy_display_name(config, snap)}
-• <b>체제 판별:</b> {snap['regime_label']} (200일선: {reg_str})
-• <b>주문 구분:</b> <b>{action}</b>
-• <b>체결 가격:</b> ${trade['price']:,.2f}
-• <b>체결 사유:</b> {trade.get('reason', '전략 신호 발생')}
-• <b>기준 일봉 종가:</b> ${snap['last_close']:,.2f} ({snap['active_sma_len']}일선: ${snap['active_sma']:,.2f})
-• <b>거래량 지표:</b> {snap['vol_ma_len']}일 평균의 <b>{snap['vol_ratio']:.2f}배</b> (기준 {snap['vol_mult']}배){promo_line}
-━━━━━━━━━━━━━━━━━━━━
-• <b>포지션 상태:</b> {'🟢 BTC 100% 보유' if state['position'] == 'BTC' else '⚪ 100% USDT 현금 (휩소 방어)'}
-• <b>현재 평가잔고:</b> ${cur_equity:,.2f} (누적 수익률: <b>{total_ret:+.2f}%</b>)
-• <b>체결 시각:</b> {trade['time']}
-"""
-    return msg
+    pos_short = "BTC 100% 보유" if state["position"] == "BTC" else "USDT 100% 관망"
+    return f"""<b>{header}</b>
+• <b>체결:</b> ${trade['price']:,.2f} ({snap['regime_label']})
+• <b>근거:</b> {snap['active_sma_len']}일선(${snap['active_sma']:,.0f}) {'돌파' if is_buy else '이탈'} · 거래량 {snap['vol_ratio']:.2f}배{promo_line}
+• <b>계좌:</b> {pos_short} · ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)
+• <b>시각:</b> {trade['time']}"""
 
 
 def format_daily_briefing(config, state, price, date_str, snap):
-    pos = state.get("position", "CASH")
-    initial_seed = float(state.get("initial_seed", 10000.0))
-    cur_equity = float(state["cash"]) if pos == "CASH" else float(state["btc_qty"]) * price
-    total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
     sma = snap["active_sma"]
     sma_len = snap["active_sma_len"]
     diff_pct = (snap["last_close"] / sma - 1.0) * 100.0
-    reg_str = f"${snap['regime_sma']:,.2f}" if snap.get("regime_sma") is not None else "워밍업 부족"
-
-    status_icon = "🟢" if pos == "BTC" else "⚪"
-    status_text = "BTC 보유 (상승 추세 유지)" if pos == "BTC" else "USDT 현금 대기 (하락/관망 방어)"
-
-    if pos == "BTC":
-        guidance = f"현재 {sma_len}일선 위에서 안전하게 추세를 홀딩 중입니다. ({sma_len}일선 하향 이탈 전까지 매도 없음)"
-    elif snap["is_above"]:
-        guidance = (
-            f"가격이 {sma_len}일선 위에 있으나 거래량이 {snap['vol_ma_len']}일 평균의 {snap['vol_ratio']:.2f}배로 "
-            f"{snap['regime_label']} 기준({snap['vol_mult']}배)에 미달하여 현금을 유지합니다."
-        )
-    else:
-        guidance = (
-            f"가격이 {sma_len}일선 아래({diff_pct:+.2f}%)에 머물러 현금 100% 보존 중입니다. "
-            f"{sma_len}일선 돌파 & 거래량 {snap['vol_mult']}배 충족 시 익일 시가 매수합니다."
-        )
-
-    vol_tag = f"🟢 {snap['vol_ratio']:.2f}배 ({snap['vol_mult']}배 충족)" if snap["vol_ok"] else f"⚪ {snap['vol_ratio']:.2f}배 ({snap['vol_mult']}배 미달)"
-
-    msg = f"""<b>📅 [BTC Quant Lab 일봉 마감 브리핑]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>전략:</b> {_strategy_display_name(config, snap)}
-• <b>기준일자:</b> {date_str} (UTC 00:00 마감)
-• <b>장세 체제:</b> {snap['regime_label']} (200일선: {reg_str})
-• <b>확정 종가:</b> ${snap['last_close']:,.2f}
-• <b>일봉 {sma_len}일선:</b> ${sma:,.2f} (괴리율: <b>{diff_pct:+.2f}%</b>)
-• <b>일봉 거래량:</b> {snap['last_vol']:,.1f} BTC ({snap['vol_ma_len']}일 평균: {snap['prior_vol_avg']:,.1f} BTC)
-• <b>거래량 필터:</b> <b>{vol_tag}</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>현재 포지션:</b> {status_icon} <b>{status_text}</b>
-• <b>가상 평가자산:</b> ${cur_equity:,.2f}
-• <b>누적 모의수익률:</b> <b>{total_ret:+.2f}%</b> (초기 ${initial_seed:,.0f})
-━━━━━━━━━━━━━━━━━━━━
-💡 <b>오늘의 전략 가이드:</b>
-{guidance}
-"""
-    return msg
+    badge, action_guide, cur_equity, total_ret, vol_mark = describe_position_action(state, snap, price)
+    return f"""<b>{badge} 일봉 마감 ({date_str})</b>
+• <b>행동:</b> {action_guide}
+• <b>종가/기준선:</b> ${snap['last_close']:,.0f} ({sma_len}일선 <b>{diff_pct:+.2f}%</b> · {snap['regime_label']})
+• <b>거래량:</b> {vol_mark} {snap['vol_ratio']:.2f}배 (기준 {snap['vol_mult']}배)
+• <b>잔고:</b> ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)"""
 
 
 def check_sma_touch_alert(config, state, state_path=STATE_PATH):
@@ -706,19 +688,18 @@ def check_sma_touch_alert(config, state, state_path=STATE_PATH):
 
     diff_active = abs(cur_price - sma_active) / sma_active * 100.0
     if diff_active <= threshold_pct and (now_ts - last_alerts.get("sma_active", 0) > cooldown_sec):
-        direction = f"위에서 {active_len}일선으로 하강 터치 ⬇️" if cur_price >= sma_active else f"아래에서 {active_len}일선으로 상승 돌파 터치 ⬆️"
         is_bull = sma_regime is not None and cur_price > sma_regime
         req_mult = config.get("bull_vol_mult", 1.2) if is_bull else config.get("bear_vol_mult", 1.8)
-        req_ma = config.get("bull_vol_ma", 20) if is_bull else config.get("bear_vol_ma", 5)
-        msg = f"""<b>🔔 [BTC {active_len}일선(모델 C 매매선) 실시간 터치 경보!]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>비트코인 현재가:</b> ${cur_price:,.2f}
-• <b>일봉 {active_len}일선:</b> ${sma_active:,.2f}
-• <b>이평선 괴리율:</b> <b>{diff_active:.2f}%</b>
-• <b>터치 형태:</b> {direction}
-━━━━━━━━━━━━━━━━━━━━
-💡 <b>체결 조건 ({'강세장' if is_bull else '약세장'} 모드):</b>
-일봉 마감(UTC 00:00) 시 종가 &gt; {active_len}일선 및 당일 거래량 ≥ 직전 {req_ma}일 평균 × <b>{req_mult}배</b> 충족 시 익일 시가 매수."""
+        pos_now = state.get("position", "CASH")
+        if pos_now == "BTC":
+            header = f"🟠 [매도 주의 · 관망] {active_len}일선 터치 (오차 {diff_active:.2f}%)"
+            hint = f"UTC 00:00 일봉 마감 시 ${sma_active:,.0f} 아래면 <b>매도 전환</b>"
+        else:
+            header = f"🟡 [관망 · 매수 임박] {active_len}일선 터치 (오차 {diff_active:.2f}%)"
+            hint = f"UTC 00:00 마감 시 ${sma_active:,.0f} 돌파 + 거래량 {req_mult}배면 <b>익일 매수</b>"
+        msg = f"""<b>{header}</b>
+• <b>현재가 / {active_len}일선:</b> ${cur_price:,.2f} / ${sma_active:,.2f}
+• <b>판단 기준:</b> {hint}"""
         if send_telegram_message(token, chat_id, msg):
             last_alerts["sma_active"] = now_ts
             save_state(state, state_path=state_path)
@@ -728,15 +709,10 @@ def check_sma_touch_alert(config, state, state_path=STATE_PATH):
     if sma_regime is not None:
         diff_regime = abs(cur_price - sma_regime) / sma_regime * 100.0
         if diff_regime <= threshold_pct and (now_ts - last_alerts.get("sma_regime", 0) > cooldown_sec):
-            direction = f"위에서 {regime_len}일선으로 하강 터치 ⬇️" if cur_price >= sma_regime else f"아래에서 {regime_len}일선으로 상승 돌파 터치 ⬆️"
-            msg = f"""<b>🔔 [BTC {regime_len}일선(거시 체제선) 실시간 터치 경보!]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>비트코인 현재가:</b> ${cur_price:,.2f}
-• <b>일봉 {regime_len}일선:</b> ${sma_regime:,.2f}
-• <b>이평선 괴리율:</b> <b>{diff_regime:.2f}%</b>
-• <b>터치 형태:</b> {direction}
-━━━━━━━━━━━━━━━━━━━━
-💡 <b>참고:</b> 200일선 상회 시 강세 필터(1.2x·20일), 하회 시 약세 스나이퍼(1.8x·5일)로 장세 모드가 전환됩니다."""
+            side_tag = "강세장" if cur_price >= sma_regime else "약세장"
+            msg = f"""<b>🟡 [관망 · 체제선 접근] {regime_len}일선 터치 ({diff_regime:.2f}%)</b>
+• <b>현재가 / {regime_len}일선:</b> ${cur_price:,.2f} / ${sma_regime:,.2f}
+• <b>참고:</b> {side_tag} 기준선 경계 (거래량 필터 자동 전환 구간)"""
             if send_telegram_message(token, chat_id, msg):
                 last_alerts["sma_regime"] = now_ts
                 save_state(state, state_path=state_path)
@@ -860,7 +836,7 @@ def summarize_dip_ledger(config, state):
 
 
 def format_dip_exit_alert(config, state, record):
-    """Build Telegram notification for a 2h fixed-time short-dip exit settlement."""
+    """Build concise Telegram notification for a 2h fixed-time short-dip exit settlement."""
     summary = summarize_dip_ledger(config, state)
     pnl_pct = float(record.get("pnl_pct", 0.0))
     icon = "🟢" if pnl_pct > 0 else "🔴"
@@ -870,24 +846,17 @@ def format_dip_exit_alert(config, state, record):
     if drop_actual is not None:
         trigger_note = f"{float(drop_actual):+.2f}%"
         if vr is not None:
-            trigger_note += f" · 거래량 {float(vr):.2f}배"
-    entry_live = float(record.get("entry_live_price") or record.get("entry_ref_price") or 0.0)
+            trigger_note += f" · {float(vr):.1f}x"
     entry_ref = float(record.get("entry_ref_price") or 0.0)
     exit_ref = float(record.get("exit_ref_price") or 0.0)
-    live_gap_pct = ((entry_live / entry_ref) - 1.0) * 100.0 if entry_ref > 0 and entry_live > 0 else 0.0
     exit_utc = datetime.fromtimestamp(int(record["exit_open_ms"]) / 1000.0, tz=timezone.utc)
     exit_tor = exit_utc.astimezone(TORONTO_TZ)
+    hold_h = int(record.get("hold_bars", 24)) * 5 / 60.0
 
-    return f"""<b>🏁 [현금대기 단타 · {int(record.get('hold_bars', 24)) * 5 / 60:g}시간 청산 타임 도래!]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>청산 결과:</b> {icon} <b>{pnl_pct:+.2f}%</b> (수수료·슬리피지 반영 후)
-• <b>진입 신호 조건:</b> {trigger_note or '-'}
-• <b>매수 기준 시가(QIS-7):</b> ${entry_ref:,.2f} (체결가 ${record['entry_price']:,.2f} · 당시 라이브 ${entry_live:,.2f} [{live_gap_pct:+.2f}%])
-• <b>청산 기준 시가(QIS-7):</b> ${exit_ref:,.2f} (체결가 ${record['exit_price']:,.2f})
-• <b>청산 시각:</b> {exit_utc.strftime('%H:%M UTC')} (토론토 {exit_tor.strftime('%H:%M %Z')})
-━━━━━━━━━━━━━━━━━━━━
-📊 <b>단타 모의 원장 누적:</b> {summary['closed_count']}전 {summary['wins']}승 {summary['losses']}패 (승률 {summary['win_rate_pct']:.1f}% · 추세승계 {summary['promoted_count']}회)
-• <b>단타 누적 수익률:</b> <b>{summary['total_ret_pct']:+.2f}%</b> (모의잔고 ${summary['dip_cash']:,.2f})"""
+    return f"""<b>🔴 [매도 · {hold_h:g}h 단타] 청산 타임 도래 ({icon} {pnl_pct:+.2f}%)</b>
+• <b>행동:</b> <b>단타 전량 매도(청산)</b> · ${entry_ref:,.0f} → ${exit_ref:,.0f}
+• <b>신호/시각:</b> {trigger_note or '-'} · {exit_tor.strftime('%H:%M %Z')} ({exit_utc.strftime('%H:%M UTC')})
+• <b>누적 원장:</b> {summary['closed_count']}전 {summary['wins']}승 {summary['losses']}패 ({summary['win_rate_pct']:.1f}%) · <b>{summary['total_ret_pct']:+.2f}%</b> (${summary['dip_cash']:,.0f})"""
 
 
 def _retry_unsent_dip_exits(config, state, state_path, cur_ms, token, chat_id):
@@ -1142,22 +1111,15 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
     entry_tor = entry_utc.astimezone(TORONTO_TZ)
     exit_tor = exit_utc.astimezone(TORONTO_TZ)
     lag_min = max(0, int((cur_ms - entry_open_ms) // 60000))
-    lag_note = f" (신호 발생 약 {lag_min}분 경과)" if lag_min >= 5 else " (방금 확정)"
     vr = snap["triggered_vol_ratio"]
-    vol_line = f"\n• <b>투매 거래량 배수:</b> <b>{vr:.2f}배</b> (14일 평균 대비 · 기준 {vol_mult:g}배)" if (vol_mult > 1.0 and vr is not None) else ""
-    vol_tag = f" (거래량 {vol_mult:g}x)" if vol_mult > 1.0 else ""
+    vol_note = f" · 거래량 <b>{vr:.2f}배</b>" if (vol_mult > 1.0 and vr is not None) else ""
+    vol_crit = f"·{vol_mult:g}x" if vol_mult > 1.0 else ""
+    lag_tag = f" ({lag_min}분 경과)" if lag_min >= 5 else ""
 
-    msg = f"""<b>⚡ [현금대기 전용 · BTC {lb_hours:g}시간 -{drop_pct:g}%{vol_tag} 급락 반등 경보!]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>현재 모델 C 상태:</b> ⚪ 현금 대기 중 (CASH)
-• <b>확정 5분봉 급락률:</b> <b>{snap['triggered_ret_pct']:+.2f}%</b>{lag_note}{vol_line}
-• <b>기준가 ({lb_hours:g}h 전 종가):</b> ${trig_ref['close']:,.2f}
-• <b>확정 종가:</b> ${trig_bar['close']:,.2f} (현재가: ${live_price:,.2f} · QIS-7 시가: ${entry_ref_price:,.2f})
-━━━━━━━━━━━━━━━━━━━━
-📌 <b>단타 전략 규격 (SL/TP 미사용 · 고정 시간청산)</b>
-• <b>신호 봉 기준 시가:</b> {entry_utc.strftime('%H:%M UTC')} (토론토 {entry_tor.strftime('%H:%M %Z')})
-• <b>예상 {hold_hours:g}시간 청산:</b> {exit_utc.strftime('%H:%M UTC')} (토론토 {exit_tor.strftime('%H:%M %Z')}) — 청산 시각 자동 알림
-• <b>백테스트 참고 (QIS-7):</b> 단독 +592.4% (25~26년 +27.1% · 승률 63.1%), 폭락 중 좁은 손절 금지."""
+    msg = f"""<b>🟢 [매수 · {hold_hours:g}h 단타] 급락 반등 타점{lag_tag}</b>
+• <b>행동:</b> <b>BTC 단타 매수</b> (현금대기 전용 · {hold_hours:g}h 후 매도)
+• <b>현재가:</b> <b>${live_price:,.2f}</b> (급락 <b>{snap['triggered_ret_pct']:+.2f}%</b>{vol_note})
+• <b>기준/청산:</b> {lb_hours:g}h -{drop_pct:g}%{vol_crit} · 예정 <b>{exit_tor.strftime('%H:%M %Z')}</b> ({exit_utc.strftime('%H:%M UTC')})"""
 
     sent = send_telegram_message(token, chat_id, msg)
     if sent:
@@ -1246,47 +1208,35 @@ def get_dip_status_text(config, state, now_ms=None, candles_5m=None, candles_1h=
         mtm_pct = ((live_price / entry_ref) - 1.0) * 100.0 if entry_ref > 0 else 0.0
         exit_utc = datetime.fromtimestamp(exit_open_ms / 1000.0, tz=timezone.utc)
         exit_tor = exit_utc.astimezone(TORONTO_TZ)
-        watch_status = f"⏳ 2h 단타 모의 보유 중 (청산까지 약 {rem_min}분)"
+        header_action = f"🟢 [단타 매수 보유] 진행 중 (청산 약 {rem_min}분 뒤)"
         open_block = (
-            f"\n• <b>진행 중 단타:</b> 진입 시가 ${entry_ref:,.2f} (현재 <b>{mtm_pct:+.2f}%</b> · "
-            f"예정 청산 {exit_utc.strftime('%H:%M UTC')} / {exit_tor.strftime('%H:%M %Z')})"
+            f"\n• <b>진입 → 청산:</b> ${entry_ref:,.0f} (<b>{mtm_pct:+.2f}%</b>) → {exit_tor.strftime('%H:%M %Z')} 매도"
         )
     elif not enabled:
-        watch_status = "🔕 비활성화 (<code>/mode dip</code> 또는 <code>/mode all</code>로 켜기)"
+        header_action = "🟡 [관망 · 단타 꺼짐]"
     elif cash_only and pos != "CASH":
-        watch_status = "⏸️ 일시정지 (현재 모델 C <b>BTC 보유 중</b> — 현금 전환 시 자동 가동)"
+        header_action = "🟡 [단타 일시정지 · 모델 C 매수 보유 중]"
     else:
         remain_cd = max(0, int(cooldown_sec - (cur_ms / 1000.0 - float(state.get("last_dip_alert_ts", 0.0) or 0.0))))
         if remain_cd > 0:
-            watch_status = f"⏳ 쿨다운 중 ({remain_cd // 60}분 후 재알림 가능)"
+            header_action = f"🟡 [관망 · 쿨다운] {remain_cd // 60}분 뒤 재감시"
         elif snap["triggered"]:
-            watch_status = "🚨 급락+거래량 조건 충족!"
+            header_action = "🟢 [매수 타점] 급락+거래량 조건 충족!"
         else:
-            watch_status = f"🟢 현금대기 감시 중 ({lb_hours:g}h -{drop_pct:g}%{vol_tag} 대기)"
+            header_action = f"🟡 [관망 · 단타 대기] {lb_hours:g}h -{drop_pct:g}%{vol_tag}"
 
-    ret_str = f"<b>{ret_pct:+.2f}%</b>" if ret_pct is not None else "데이터 부족 (결측 구간)"
-    ref_str = f"${ref['close']:,.2f}" if ref else "결측"
+    ret_str = f"<b>{ret_pct:+.2f}%</b>" if ret_pct is not None else "데이터 부족"
     remain_drop = (ret_pct + drop_pct) if ret_pct is not None else None
-    dist_str = f"{remain_drop:+.2f}%p" if remain_drop is not None else "N/A"
-    vol_line = f"\n• <b>최근 {lb_hours:g}시간 거래량 배수:</b> <b>{vol_ratio:.2f}배</b> (14일 평균 대비 · 기준 {vol_mult:g}배)" if (vol_mult > 1.0 and vol_ratio is not None) else ""
+    dist_str = f"목표까지 {remain_drop:+.2f}%p" if remain_drop is not None else "결측"
+    vol_line = f"\n• <b>거래량 배수:</b> <b>{vol_ratio:.2f}배</b> (기준 {vol_mult:g}배)" if (vol_mult > 1.0 and vol_ratio is not None) else ""
 
     summary = summarize_dip_ledger(config, state)
     ledger_line = ""
     if summary["closed_count"] > 0 or summary["promoted_count"] > 0:
-        ledger_line = (
-            f"\n• <b>단타 모의원장:</b> {summary['closed_count']}회 청산 ({summary['wins']}승 {summary['losses']}패 · "
-            f"승률 {summary['win_rate_pct']:.1f}%) · 추세승계 {summary['promoted_count']}회 · 누적 <b>{summary['total_ret_pct']:+.2f}%</b>"
-        )
+        ledger_line = f"\n• <b>단타 누적:</b> {summary['closed_count']}전 {summary['wins']}승 {summary['losses']}패 ({summary['win_rate_pct']:.1f}%) · <b>{summary['total_ret_pct']:+.2f}%</b>"
 
-    return f"""<b>⚡ [현금대기 전용 · {lb_hours:g}시간 -{drop_pct:g}%{vol_tag} 급락 감시 현황]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>현재 모델 C 포지션:</b> {'⚪ CASH (현금 대기)' if pos == 'CASH' else '🟢 BTC (추세 보유 중)'}
-• <b>감시 상태:</b> {watch_status}{open_block}
-• <b>비트코인 현재가:</b> ${live_price:,.2f} (직전 5m 종가: ${latest['close']:,.2f})
-• <b>{lb_hours:g}시간 전 기준 종가:</b> {ref_str}
-• <b>최근 {lb_hours:g}시간 등락률:</b> {ret_str} (트리거 -{drop_pct:g}%까지 {dist_str}){vol_line}
-• <b>청산 규격:</b> 진입 후 {hold_hours:g}시간({hold_bars}봉) 고정 청산{ledger_line}
-"""
+    return f"""<b>{header_action}</b>
+• <b>현재가 / {lb_hours:g}h 등락:</b> ${live_price:,.2f} · {ret_str} ({dist_str}){vol_line}{open_block}{ledger_line}"""
 
 
 def get_touch_status_text(config):
@@ -1303,32 +1253,17 @@ def get_touch_status_text(config):
     sma_regime = sum(closes[-regime_len:]) / float(regime_len) if len(closes) >= regime_len else None
 
     threshold = float(config.get("touch_threshold_pct", 0.5))
-    gap_a = cur_price - sma_active
-    diff_a = abs(gap_a) / sma_active * 100.0
-
-    regime_block = "• <b>일봉 200일선:</b> 데이터 준비 중"
+    gap_a = (cur_price / sma_active - 1.0) * 100.0
+    flag_a = "🚨 터치권!" if abs(gap_a) <= threshold else "관망"
+    reg_line = ""
     if sma_regime is not None:
-        gap_r = cur_price - sma_regime
-        diff_r = abs(gap_r) / sma_regime * 100.0
-        regime_block = (
-            f"• <b>일봉 {regime_len}일선 (체제선):</b> ${sma_regime:,.2f}\n"
-            f"  - 남은 거리: ${abs(gap_r):,.2f} (괴리율 <b>{gap_r / sma_regime * 100:+.2f}%</b>)\n"
-            f"  - 감시 상태: {'🚨 터치권 진입!' if diff_r <= threshold else '대기 중'}"
-        )
+        gap_r = (cur_price / sma_regime - 1.0) * 100.0
+        flag_r = "🚨 터치권!" if abs(gap_r) <= threshold else ("강세권" if cur_price > sma_regime else "약세권")
+        reg_line = f"\n• <b>{regime_len}일선(체제선):</b> ${sma_regime:,.0f} (<b>{gap_r:+.2f}%</b> · {flag_r})"
 
-    return f"""<b>🎯 [BTC 주요 이평선 터치 감시 현황]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>비트코인 현재가:</b> ${cur_price:,.2f}
-
-• <b>일봉 {active_len}일선 (모델 C 매매선):</b> ${sma_active:,.2f}
-  - 남은 거리: ${abs(gap_a):,.2f} (괴리율 <b>{gap_a / sma_active * 100:+.2f}%</b>)
-  - 감시 상태: {'🚨 터치권 진입!' if diff_a <= threshold else '대기 중'}
-
-{regime_block}
-━━━━━━━━━━━━━━━━━━━━
-• <b>터치 감도:</b> 오차 ±{threshold}% 이내 도달 시 즉시 알림
-• <b>전략:</b> {_strategy_display_name(config)}
-"""
+    return f"""<b>🎯 [기준선 터치 감시]</b> (현재가 ${cur_price:,.2f})
+• <b>{active_len}일선(매매선):</b> ${sma_active:,.0f} (<b>{gap_a:+.2f}%</b> · {flag_a}){reg_line}
+• <b>알림 기준:</b> ±{threshold}% 이내 근접 시 즉시 알림"""
 
 
 def get_current_status_text(config, state):
@@ -1347,13 +1282,12 @@ def get_current_status_text(config, state):
     sma = snap["active_sma"]
     sma_len = snap["active_sma_len"]
     diff_pct = (current_price / sma - 1.0) * 100.0
-    reg_str = f"${snap['regime_sma']:,.2f}" if snap["regime_sma"] is not None else "준비 중"
 
     pos = prev_pos
     initial_seed = float(state.get("initial_seed", 10000.0))
     cur_equity = float(state["cash"]) if pos == "CASH" else float(state["btc_qty"]) * current_price
     total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
-    vol_tag = f"🟢 {snap['vol_ratio']:.2f}배 ({snap['vol_mult']}배 충족)" if snap["vol_ok"] else f"⚪ {snap['vol_ratio']:.2f}배 ({snap['vol_mult']}배 미달)"
+    vol_ok_txt = "✅충족" if snap["vol_ok"] else "미달"
 
     dip_lb_h = int(config.get("dip_alert_lookback_bars", 24)) * 5 / 60.0
     dip_drop = float(config.get("dip_alert_drop_pct", 4.5))
@@ -1361,39 +1295,36 @@ def get_current_status_text(config, state):
     dip_spec = f"{dip_lb_h:g}h -{dip_drop:g}% · {dip_vm:g}x" if dip_vm > 1.0 else f"{dip_lb_h:g}h -{dip_drop:g}%"
     open_dip = state.get("open_dip")
     if not config.get("dip_alert_enabled", True):
-        dip_status_str = "🔕 꺼짐"
+        dip_status_str = "꺼짐"
     elif isinstance(open_dip, dict):
         exit_utc = datetime.fromtimestamp(int(open_dip.get("exit_open_ms", 0) or 0) / 1000.0, tz=timezone.utc)
-        dip_status_str = f"⏳ 단타 보유 중 (청산 {exit_utc.strftime('%H:%M UTC')})"
+        dip_status_str = f"단타 보유 중 (청산 {exit_utc.strftime('%H:%M UTC')})"
     elif config.get("dip_alert_cash_only", True) and pos != "CASH":
-        dip_status_str = "⏸️ 정지 (BTC 보유 중)"
+        dip_status_str = "정지 (BTC 보유 중)"
     else:
-        dip_status_str = f"🟢 가동 중 ({dip_spec})"
+        dip_status_str = f"감시 중 ({dip_spec})"
+
+    if pos == "BTC":
+        header = "🟢 [매수 유지 · BTC 보유 중]"
+        next_cond = f"{sma_len}일선(${sma:,.0f}) 이탈 시 <b>매도</b>"
+    elif isinstance(open_dip, dict):
+        header = "🟢 [단타 매수 보유] · 추세는 관망"
+        next_cond = f"${sma:,.0f} 돌파+거래량 {snap['vol_mult']}배 시 <b>추세 매수</b>"
+    else:
+        header = "🟡 [관망 · 현금 100% 대기 중]"
+        next_cond = f"${sma:,.0f} 돌파 + 거래량 {snap['vol_mult']}배 시 <b>매수</b>"
 
     dip_summary = summarize_dip_ledger(config, state)
     dip_ledger_str = ""
     if dip_summary["closed_count"] > 0 or dip_summary["promoted_count"] > 0:
-        dip_ledger_str = (
-            f"\n• <b>단타 모의원장:</b> {dip_summary['closed_count']}회 청산 ({dip_summary['wins']}승 "
-            f"{dip_summary['losses']}패 · 승률 {dip_summary['win_rate_pct']:.1f}%) · 승계 {dip_summary['promoted_count']}회 · "
-            f"누적 <b>{dip_summary['total_ret_pct']:+.2f}%</b>"
-        )
+        dip_ledger_str = f" · {dip_summary['wins']}승{dip_summary['losses']}패({dip_summary['total_ret_pct']:+.1f}%)"
 
-    return f"""<b>📊 [BTC Quant Lab 실시간 모의투자 현황]</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>전략:</b> {_strategy_display_name(config, snap)}
-• <b>장세 체제:</b> {snap['regime_label']} (200일선: {reg_str})
-• <b>비트코인 현재가:</b> ${current_price:,.2f} (직전 마감: ${snap['last_close']:,.2f})
-• <b>일봉 {sma_len}일선:</b> ${sma:,.2f} (괴리율: <b>{diff_pct:+.2f}%</b> {'🟢 상회' if diff_pct > 0 else '🔴 하회'})
-• <b>직전 거래량:</b> {snap['last_vol']:,.1f} BTC ({snap['vol_ma_len']}일 평균: {snap['prior_vol_avg']:,.1f} BTC)
-• <b>거래량 배수:</b> <b>{vol_tag}</b>
-━━━━━━━━━━━━━━━━━━━━
-• <b>보유 포지션:</b> {'🟢 비트코인 100% 보유' if pos == 'BTC' else '⚪ 100% USDT 현금 (휩소 방어 중)'}
-• <b>현금대기 급락알림:</b> {dip_status_str}
-• <b>가상 평가잔고:</b> ${cur_equity:,.2f} USDT
-• <b>누적 수익률:</b> <b>{total_ret:+.2f}%</b>
-• <b>총 체결 건수:</b> {len(state.get('trades', []))}회{dip_ledger_str}
-"""
+    return f"""<b>{header}</b>
+• <b>현재가 / {sma_len}일선:</b> ${current_price:,.2f} (<b>{diff_pct:+.2f}%</b> · {snap['regime_label']})
+• <b>거래량:</b> {snap['vol_ratio']:.2f}배 / 기준 {snap['vol_mult']}배 ({vol_ok_txt})
+• <b>다음 기준:</b> {next_cond}
+• <b>단타 감시:</b> {dip_status_str}{dip_ledger_str}
+• <b>모의잔고:</b> ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)"""
 
 
 if __name__ == "__main__":

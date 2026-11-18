@@ -75,7 +75,7 @@ def run_cloud_monitor(state_path=STATE_PATH):
         or bool(state.get("notify_next_5m_close"))
     )
     if want_status_once:
-        status_msg = "<b>☁️ [GitHub 클라우드 봇 · 5분봉 마감 점검 리포트]</b>\n\n" + get_dip_status_text(config, state)
+        status_msg = "<b>☁️ [5분봉 마감 점검]</b>\n" + get_dip_status_text(config, state)
         if send_telegram_message(config.get("bot_token"), config.get("chat_id"), status_msg):
             print("Sent 5m candle close status report to Telegram!")
             if state.get("notify_next_5m_close"):
