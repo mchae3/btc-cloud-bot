@@ -19,6 +19,7 @@ from paper_trader import (
     _safe_float,
     _safe_int,
     _strategy_display_name,
+    apply_strategy_preset,
     check_dip_alert,
     check_sma_touch_alert,
     compute_live_signal_snapshot,
@@ -181,21 +182,35 @@ def dispatch_command(text, config, state, state_path=STATE_PATH, config_path=CON
 
     try:
         if cmd in ("/start", "/help", "도움말"):
+            lb_h = _safe_int(config.get("dip_alert_lookback_bars", 24), 24) * 5 / 60.0
+            dp = _safe_float(config.get("dip_alert_drop_pct", 4.5), 4.5)
+            vm = _safe_float(config.get("dip_alert_vol_mult", 2.5), 2.5)
+            bear_note = "·약세전용" if bool(config.get("dip_alert_bear_only", False)) else ""
             return (
                 f"<b>👋 안녕하세요! BTC Quant Lab 봇입니다. (토론토 EST/EDT 기준)</b>\n\n"
-                f"<b>🔥 활성 전략: {_strategy_display_name(config)}</b>\n\n"
+                f"<b>🔥 활성 전략: {_strategy_display_name(config)}</b>\n"
+                f"<b>⚡ 급락 단타 기준: {lb_h:g}h -{dp:g}% · 거래량 {vm:g}x{bear_note}</b>\n\n"
                 "<b>📌 사용 가능한 명령어:</b>\n"
                 "• <code>/status</code> 또는 <code>/상태</code>: 실시간 시세, 40일/200일선, 거래량 배수, 모의잔고 조회\n"
                 "• <code>/touch</code> 또는 <code>/터치</code>: 40일선 / 200일선까지 남은 거리 및 감시 현황\n"
-                "• <code>/dip</code> 또는 <code>/급락</code>: ⚡ 현금대기 전용 2시간 -4.5%(거래량 2.5x) 급락 감시 현황 조회\n"
+                "• <code>/dip</code> 또는 <code>/급락</code>: ⚡ 현금대기 전용 급락 감시 현황 조회\n"
                 "• <code>/briefing</code> 또는 <code>/아침</code>: 🌅 토론토 모닝 브리핑 즉시 미리보기\n"
-                "• <code>/mode dip</code>: [현금대기 급락 알림 전용] (브리핑/터치 끄고 2h -4.5%·거래량2.5x 급락만 감시)\n"
-                "• <code>/mode touch</code>: [닿을 때만 알림 모드] (아침 브리핑 OFF · 터치+급락 ON)\n"
-                "• <code>/mode all</code>: [전체 알림 모드] (브리핑 + 터치 알림 + 현금대기 급락 알림)\n"
+                "• <code>/mode dip</code> / <code>/mode touch</code> / <code>/mode all</code>: 알림 모드 전환\n"
+                "• <code>/v2</code> / <code>/v2_2h</code> / <code>/v1</code>: 전략 프리셋 전환 (v2 24h 권장 / v2 2h / v1 원본)\n"
                 "• <code>/check</code>: 바이낸스 일봉 즉시 재계산 및 신호 확인\n"
                 "• <code>/trades</code>: 최근 체결 내역 조회\n"
                 "• <code>/oos</code> 또는 <code>/성과</code>: 🧪 실시간 미관측 OOS 점수판 (BTC 보유 대비 알파)\n"
                 "• <code>/help</code>: 도움말"
+            ), state
+
+        if cmd in ("/v2", "/v2_2h", "/v1"):
+            preset_key = cmd.lstrip("/")
+            label = apply_strategy_preset(config, preset_key)
+            save_state(config, state_path=config_path)
+            return (
+                f"<b>✅ [전략 프리셋 전환 완료]</b>\n"
+                f"• <b>적용 프리셋:</b> {label}\n"
+                f"• <b>활성 전략:</b> {_strategy_display_name(config)}"
             ), state
 
         if cmd in ("/briefing", "/아침", "브리핑", "아침"):

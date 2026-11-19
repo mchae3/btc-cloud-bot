@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     "bull_vol_ma": 20,
     "bear_vol_mult": 1.8,
     "bear_vol_ma": 5,
+    "exit_confirm_days": 1,       # 청산 이탈 확인 일수 (1=기존 즉시, 2=2일 연속 이탈 확인)
     # Legacy fallback keys (used only if strategy_name is explicitly non-hybrid)
     "strategy_sma": 40,
     "volume_multiplier": 1.2,
@@ -46,14 +47,65 @@ DEFAULT_CONFIG = {
     "touch_alert_enabled": True,  # 40일선/200일선 터치 감지 알림
     "touch_threshold_pct": 0.5,   # 오차 0.5% 이내 근접 시 터치 판정
     "touch_cooldown_sec": 7200,   # 같은 선 터치 알림 쿨다운 (2시간)
-    "dip_alert_enabled": True,    # 현금대기 중 2시간 -4.5%(거래량 2.5x) 급락 알림
+    "dip_alert_enabled": True,    # 현금대기 중 급락 반등 알림
     "dip_alert_cash_only": True,  # 모델 C 현금(CASH) 대기 상태일 때만 급락 알림 발송
-    "dip_alert_lookback_bars": 24,  # 24 × 5분 = 2시간
-    "dip_alert_drop_pct": 4.5,    # 2시간 종가 대비 -4.5% 이상 급락 시 알림
-    "dip_alert_vol_mult": 2.5,    # 직전 14일 평균 대비 투매 거래량 배수 필터 (1.0=미사용)
-    "dip_alert_hold_bars": 24,    # 권장 보유 2시간(24봉) 안내용
-    "dip_alert_cooldown_sec": 7200  # 급락 알림 중복 방지 쿨다운 (2시간)
+    "dip_alert_bear_only": False, # True면 200일선 이하(약세장) 현금 구간에서만 단타 진입
+    "dip_alert_lookback_bars": 24,  # 24 × 5분 = 2시간 (v2: 288 = 24시간)
+    "dip_alert_drop_pct": 4.5,    # 급락 기준 % (v2: 10.0)
+    "dip_alert_vol_mult": 2.5,    # 직전 14일 평균 대비 투매 거래량 배수 필터 (1.0=미사용, v2: 1.5)
+    "dip_alert_hold_bars": 24,    # 보유 봉 수 (v2: 288 = 24시간)
+    "dip_alert_cooldown_sec": 7200  # 급락 알림 중복 방지 쿨다운 (v2: 86400 = 24시간)
 }
+
+STRATEGY_PRESETS = {
+    "v2": {
+        "label": "🚀 v2 메인 추천 (모델C 2일확인 + 24h -10% · 1.5x · 24h · 약세전용)",
+        "exit_confirm_days": 2,
+        "dip_alert_bear_only": True,
+        "dip_alert_lookback_bars": 288,
+        "dip_alert_drop_pct": 10.0,
+        "dip_alert_vol_mult": 1.5,
+        "dip_alert_hold_bars": 288,
+        "dip_alert_cooldown_sec": 86400,
+    },
+    "v2_2h": {
+        "label": "⚡ v2 고수익 2h (모델C 2일확인 + 2h -4.5% · 2.5x · 2h · 약세전용)",
+        "exit_confirm_days": 2,
+        "dip_alert_bear_only": True,
+        "dip_alert_lookback_bars": 24,
+        "dip_alert_drop_pct": 4.5,
+        "dip_alert_vol_mult": 2.5,
+        "dip_alert_hold_bars": 24,
+        "dip_alert_cooldown_sec": 7200,
+    },
+    "v1": {
+        "label": "📌 v1 기존 원본 (모델C 1일즉시 + 2h -4.5% · 2.5x · 2h · 전체)",
+        "exit_confirm_days": 1,
+        "dip_alert_bear_only": False,
+        "dip_alert_lookback_bars": 24,
+        "dip_alert_drop_pct": 4.5,
+        "dip_alert_vol_mult": 2.5,
+        "dip_alert_hold_bars": 24,
+        "dip_alert_cooldown_sec": 7200,
+    },
+}
+
+
+def apply_strategy_preset(config, preset_name):
+    """Apply a verified strategy preset (v2, v2_2h, v1) onto config dict without touching credentials."""
+    key = str(preset_name or "").strip().lower()
+    if key not in STRATEGY_PRESETS:
+        raise ValueError(f"지원하지 않는 프리셋입니다: {preset_name}")
+    preset = STRATEGY_PRESETS[key]
+    for k, v in preset.items():
+        if k != "label":
+            config[k] = v
+    return preset["label"]
+
+
+def _required_1h_limit(lookback_bars, scan_bars=1, days=14):
+    need = int(days) * 24 + math.ceil((max(1, int(lookback_bars)) + max(1, int(scan_bars))) / 12.0) + 24
+    return min(1000, max(360, need))
 
 
 def _get_ssl_context():
@@ -155,6 +207,7 @@ def default_state(config):
         "last_morning_report_date": "",
         "trades": [],
         "last_signal": "NONE",
+        "last_regime_is_bull": None,
         "last_touch_alerts": {},
         "last_dip_alert_ts": 0.0,
         "last_dip_alert_candle_ms": 0,
@@ -561,11 +614,38 @@ def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
 
     is_above = last_close > active_sma
     is_below = last_close < active_sma
+    exit_confirm_days = max(1, min(10, _safe_int(config.get("exit_confirm_days", 1), 1)))
+    below_streak = 0
+    if is_below:
+        if exit_confirm_days == 1:
+            below_streak = 1
+        else:
+            # Causal backward streak matching backtester._model_c_hybrid_signals()
+            n_c = len(closes)
+            for idx_back in range(n_c - 1, -1, -1):
+                if is_hybrid:
+                    reg_b = (
+                        sum(closes[idx_back - regime_sma_len + 1:idx_back + 1]) / float(regime_sma_len)
+                        if idx_back >= regime_sma_len - 1 else None
+                    )
+                    bull_b = (reg_b is not None) and (closes[idx_back] > reg_b)
+                    sma_len_b = bull_sma_len if bull_b else bear_sma_len
+                else:
+                    sma_len_b = bull_sma_len
+                if idx_back < sma_len_b - 1:
+                    break
+                sma_b = sum(closes[idx_back - sma_len_b + 1:idx_back + 1]) / float(sma_len_b)
+                if closes[idx_back] < sma_b:
+                    below_streak += 1
+                    if below_streak >= exit_confirm_days:
+                        break
+                else:
+                    break
 
     if prev_pos == "CASH":
         target_pos = "BTC" if (is_above and vol_ok) else "CASH"
     else:
-        target_pos = "CASH" if is_below else "BTC"
+        target_pos = "CASH" if (below_streak >= exit_confirm_days) else "BTC"
 
     return {
         "strategy": strategy,
@@ -588,12 +668,16 @@ def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
         "vol_ok": vol_ok,
         "is_above": is_above,
         "is_below": is_below,
+        "below_streak": below_streak,
+        "exit_confirm_days": exit_confirm_days,
         "target_pos": target_pos,
     }
 
 
 def _strategy_display_name(config, snap=None):
     strategy = config.get("strategy_name", "daily_sma40_hybrid")
+    ecd = max(1, _safe_int(config.get("exit_confirm_days", 1), 1))
+    ecd_tag = f" · {ecd}일확인" if ecd > 1 else ""
     if strategy in ("daily_sma40_hybrid", "daily_sma40_volume_c", "daily_sma_hybrid", "model_c"):
         b_sma = config.get("bull_sma_len", 40)
         r_sma = config.get("bear_sma_len", 40)
@@ -602,11 +686,11 @@ def _strategy_display_name(config, snap=None):
         b_l = config.get("bull_vol_ma", 20)
         s_m = config.get("bear_vol_mult", 1.8)
         s_l = config.get("bear_vol_ma", 5)
-        return f"👑 모델 C ({b_sma}/{r_sma}일선 · {reg}일 체제전환 · 불 {b_m}x/{b_l}일 · 약세 {s_m}x/{s_l}일)"
+        return f"👑 모델 C ({b_sma}/{r_sma}일선 · {reg}일 체제전환 · 불 {b_m}x/{b_l}일 · 약세 {s_m}x/{s_l}일{ecd_tag})"
     sma = config.get("strategy_sma", 44)
     vm = config.get("volume_multiplier", 1.2)
     vl = config.get("volume_ma_len", 20)
-    return f"일봉 {sma}일 SMA + 거래량({vm}x, {vl}일)"
+    return f"일봉 {sma}일 SMA + 거래량({vm}x, {vl}일{ecd_tag})"
 
 
 def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE_PATH, now_ms=None, candles=None):
@@ -645,6 +729,7 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
     if not is_new_daily_close:
         try:
             snap = compute_live_signal_snapshot(closed, config, prev_pos=state.get("position", "CASH"))
+            state["last_regime_is_bull"] = bool(snap["is_bull"])
         except ValueError as e:
             print(f"Signal computation error: {e}")
             return state, str(e)
@@ -668,6 +753,7 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
             state["last_evaluated_candle_ms"] = last_evaluated_ms
             target_pos = snap["target_pos"]
             state["last_signal"] = target_pos
+            state["last_regime_is_bull"] = bool(snap["is_bull"])
 
             if prev_pos != target_pos:
                 if target_pos == "BTC":
@@ -758,7 +844,11 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
                         "pnl_pct": pnl_pct,
                         "regime": snap["regime_label"],
                         "vol_ratio": snap["vol_ratio"],
-                        "reason": f"{snap['active_sma_len']}일선 하향 이탈 청산",
+                        "reason": (
+                            f"{snap['active_sma_len']}일선 {snap.get('exit_confirm_days', 1)}일 연속 하향 이탈 청산"
+                            if snap.get("exit_confirm_days", 1) > 1
+                            else f"{snap['active_sma_len']}일선 하향 이탈 청산"
+                        ),
                         "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     }
                     state["trades"].append(trade_info)
@@ -1317,6 +1407,34 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
             "exit_retried": exit_retried,
         }
 
+    # Bear-only regime gate (<= SMA200): block NEW idle-cash dip entries in bull regime (after settling any open dip)
+    bear_only = bool(config.get("dip_alert_bear_only", False))
+    if bear_only and not isinstance(state.get("open_dip"), dict):
+        is_bull_reg = state.get("last_regime_is_bull")
+        if is_bull_reg is None and candles_5m is None:
+            try:
+                d_raw = fetch_binance_daily_candles(limit=_required_daily_limit(config))
+                d_closed, _ = partition_daily_candles(d_raw, now_ms=cur_ms)
+                reg_len = max(2, _safe_int(config.get("regime_sma_len", 200), 200))
+                if len(d_closed) >= reg_len:
+                    d_closes = [float(x["close"]) for x in d_closed]
+                    reg_sma = sum(d_closes[-reg_len:]) / float(reg_len)
+                    is_bull_reg = bool(d_closes[-1] > reg_sma)
+                    state["last_regime_is_bull"] = is_bull_reg
+            except Exception:
+                is_bull_reg = None
+        if is_bull_reg is True:
+            return {
+                "checked": False,
+                "alert_sent": False,
+                "skipped_reason": "bull_regime_blocked",
+                "position": pos,
+                "exit_settled": settled is not None,
+                "exit_alert_sent": bool(settled and settled.get("exit_alert_sent")),
+                "settled_trade": settled,
+                "exit_retried": exit_retried,
+            }
+
     # Retry unsent entry alert for an already-recorded open_dip (prevents ledger loss & delivers on recovery)
     existing_open = state.get("open_dip")
     if isinstance(existing_open, dict) and existing_open.get("entry_alert_sent") is False:
@@ -1346,7 +1464,10 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
     raw_1h = candles_1h
     if raw_1h is None and candles_5m is None and vol_mult > 1.0:
         try:
-            raw_1h = get_cached_binance_1h_candles(limit=360, now_ts=cur_ms / 1000.0)
+            raw_1h = get_cached_binance_1h_candles(
+                limit=_required_1h_limit(lookback_bars, scan_bars),
+                now_ts=cur_ms / 1000.0,
+            )
         except Exception:
             raw_1h = None
     closed_1h, _ = partition_candles(raw_1h, now_ms=cur_ms) if raw_1h else ([], [])
@@ -1531,7 +1652,10 @@ def get_dip_status_text(config, state, now_ms=None, candles_5m=None, candles_1h=
     cur_ms = int(now_ms) if now_ms is not None else int(time.time() * 1000)
     if raw_1h is None and candles_5m is None and vol_mult > 1.0:
         try:
-            raw_1h = get_cached_binance_1h_candles(limit=360, now_ts=cur_ms / 1000.0)
+            raw_1h = get_cached_binance_1h_candles(
+                limit=_required_1h_limit(lookback_bars, 1),
+                now_ts=cur_ms / 1000.0,
+            )
         except Exception:
             raw_1h = None
 
@@ -1576,14 +1700,17 @@ def get_dip_status_text(config, state, now_ms=None, candles_5m=None, candles_1h=
         header_action = "🟡 [관망 · 단타 꺼짐]"
     elif cash_only and pos != "CASH":
         header_action = "🟡 [단타 일시정지 · 모델 C 매수 보유 중]"
+    elif bool(config.get("dip_alert_bear_only", False)) and state.get("last_regime_is_bull") is True:
+        header_action = "🟡 [단타 일시정지 · 강세장(200일선 위 · 약세전용 모드)]"
     else:
         remain_cd = max(0, int(cooldown_sec - (cur_ms / 1000.0 - float(state.get("last_dip_alert_ts", 0.0) or 0.0))))
+        bear_tag = " · 약세전용" if bool(config.get("dip_alert_bear_only", False)) else ""
         if remain_cd > 0:
             header_action = f"🟡 [관망 · 쿨다운] {remain_cd // 60}분 뒤 재감시"
         elif snap["triggered"]:
-            header_action = "🟢 [매수 타점] 급락+거래량 조건 충족!"
+            header_action = f"🟢 [매수 타점] 급락+거래량 조건 충족!{bear_tag}"
         else:
-            header_action = f"🟡 [관망 · 단타 대기] {lb_hours:g}h -{drop_pct:g}%{vol_tag}"
+            header_action = f"🟡 [관망 · 단타 대기] {lb_hours:g}h -{drop_pct:g}%{vol_tag}{bear_tag}"
 
     ret_str = f"<b>{ret_pct:+.2f}%</b>" if ret_pct is not None else "데이터 부족"
     remain_drop = (ret_pct + drop_pct) if ret_pct is not None else None
