@@ -7,6 +7,7 @@ import json
 import math
 import os
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -89,12 +90,55 @@ def _http_get_json(url, timeout=10, retries=3):
     raise last_err
 
 
+def _safe_int(value, default=0):
+    if value is None or value == "" or isinstance(value, bool):
+        return int(default)
+    try:
+        v = float(value)
+        return int(v) if math.isfinite(v) else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _safe_float(value, default=0.0):
+    if value is None or value == "" or isinstance(value, bool):
+        return float(default)
+    try:
+        v = float(value)
+        return v if math.isfinite(v) else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _pick_positive_price(*candidates, fallback=0.0):
+    for c in candidates:
+        v = _safe_float(c, 0.0)
+        if v > 0.0:
+            return v
+    return _safe_float(fallback, 0.0)
+
+
+def _required_daily_limit(config, min_limit=250):
+    cfg = config if isinstance(config, dict) else {}
+    lens = [
+        _safe_int(cfg.get("bull_sma_len", 40), 40),
+        _safe_int(cfg.get("bear_sma_len", 40), 40),
+        _safe_int(cfg.get("strategy_sma", 44), 44),
+        _safe_int(cfg.get("regime_sma_len", 200), 200),
+        _safe_int(cfg.get("bull_vol_ma", 20), 20) + 1,
+        _safe_int(cfg.get("bear_vol_ma", 5), 5) + 1,
+        _safe_int(cfg.get("volume_ma_len", 20), 20) + 1,
+    ]
+    return min(1000, max(int(min_limit), max(lens) + 50))
+
+
 def _atomic_write_json(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    raw_path = Path(path)
+    target = Path(os.path.realpath(raw_path)) if os.path.islink(raw_path) else raw_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp_path, path)
+    os.replace(tmp_path, target)
 
 
 def default_state(config):
@@ -118,6 +162,10 @@ def default_state(config):
         "dip_cash": seed,
         "open_dip": None,
         "dip_trades": [],
+        "oos_start_utc": "",
+        "oos_start_btc_price": 0.0,
+        "oos_start_equity": seed,
+        "oos_equity_history": [],
     }
 
 
@@ -156,9 +204,11 @@ def load_state(config, state_path=STATE_PATH):
             data["last_touch_alerts"] = {}
         if not isinstance(data.get("dip_trades"), list):
             data["dip_trades"] = []
+        if not isinstance(data.get("oos_equity_history"), list):
+            data["oos_equity_history"] = []
         if data.get("open_dip") is not None and not isinstance(data.get("open_dip"), dict):
             data["open_dip"] = None
-        if float(data.get("dip_initial_seed", 0) or 0) <= 0:
+        if _safe_float(data.get("dip_initial_seed", 0), 0.0) <= 0:
             data["dip_initial_seed"] = float(base["dip_initial_seed"])
         if data.get("dip_cash") is None:
             data["dip_cash"] = float(data["dip_initial_seed"])
@@ -166,8 +216,9 @@ def load_state(config, state_path=STATE_PATH):
     except Exception as e:
         print(f"State load error (backing up corrupt file): {e}")
         try:
-            corrupt = path.with_name(f"{path.name}.corrupt.{int(time.time())}")
-            os.replace(path, corrupt)
+            target = Path(os.path.realpath(path)) if os.path.islink(path) else path
+            corrupt = target.with_name(f"{target.name}.corrupt.{int(time.time())}")
+            os.replace(target, corrupt)
         except Exception:
             pass
         _atomic_write_json(path, base)
@@ -189,7 +240,11 @@ def sync_state_from_cloud(state, state_path=STATE_PATH, url=CLOUD_STATE_RAW_URL,
         sep = "&" if "?" in url else "?"
         req = urllib.request.Request(
             f"{url}{sep}_ts={int(time.time())}",
-            headers={"User-Agent": "BTCQuantLab-StateSync/1.0", "Cache-Control": "no-cache"},
+            headers={
+                "User-Agent": "BTCQuantLab-StateSync/1.0",
+                "Cache-Control": "no-cache, no-store",
+                "Pragma": "no-cache",
+            },
         )
         with urllib.request.urlopen(req, timeout=timeout, context=_get_ssl_context()) as resp:
             remote = json.loads(resp.read().decode("utf-8"))
@@ -219,19 +274,59 @@ def sync_state_from_cloud(state, state_path=STATE_PATH, url=CLOUD_STATE_RAW_URL,
     l_dip_ms = int(state.get("last_dip_alert_candle_ms", 0) or 0)
     r_dip_trades = remote.get("dip_trades") if isinstance(remote.get("dip_trades"), list) else []
     l_dip_trades = state.get("dip_trades") if isinstance(state.get("dip_trades"), list) else []
+    r_open = remote.get("open_dip") if isinstance(remote.get("open_dip"), dict) else None
+    l_open = state.get("open_dip") if isinstance(state.get("open_dip"), dict) else None
+    l_settled_sigs = {int(t.get("signal_candle_ms", 0) or 0) for t in l_dip_trades if isinstance(t, dict)}
+    r_open_sig = int(r_open.get("signal_candle_ms", 0) or 0) if r_open else 0
+    remote_settled_local_open = (
+        r_dip_ms == l_dip_ms
+        and len(r_dip_trades) == len(l_dip_trades)
+        and r_open is None
+        and l_open is not None
+    )
+    remote_opened_new_unsettled = (
+        r_dip_ms == l_dip_ms
+        and r_dip_ms > 0
+        and len(r_dip_trades) == len(l_dip_trades)
+        and l_open is None
+        and r_open is not None
+        and (r_open_sig == 0 or r_open_sig not in l_settled_sigs)
+    )
     if (
         r_dip_ms > l_dip_ms
         or len(r_dip_trades) > len(l_dip_trades)
-        or (r_dip_ms == l_dip_ms and remote.get("open_dip") != state.get("open_dip") and r_dip_ms > 0)
+        or remote_settled_local_open
+        or remote_opened_new_unsettled
     ):
         for k in ("last_dip_alert_candle_ms", "open_dip", "dip_trades", "dip_cash", "dip_initial_seed"):
             if k in remote and state.get(k) != remote[k]:
                 state[k] = remote[k]
                 dirty = True
         r_dip_ts = float(remote.get("last_dip_alert_ts", 0.0) or 0.0)
-        if r_dip_ts > float(state.get("last_dip_alert_ts", 0.0) or 0.0):
+        if r_dip_ts > _safe_float(state.get("last_dip_alert_ts", 0.0), 0.0):
             state["last_dip_alert_ts"] = r_dip_ts
             dirty = True
+    else:
+        if (
+            isinstance(l_open, dict)
+            and isinstance(r_open, dict)
+            and _safe_int(l_open.get("signal_candle_ms", 0), 0) == _safe_int(r_open.get("signal_candle_ms", 0), 0)
+            and l_open.get("entry_alert_sent") is False
+            and r_open.get("entry_alert_sent", True) is True
+        ):
+            l_open["entry_alert_sent"] = True
+            dirty = True
+        if len(r_dip_trades) == len(l_dip_trades) and l_dip_trades:
+            for lt, rt in zip(l_dip_trades, r_dip_trades):
+                if (
+                    isinstance(lt, dict)
+                    and isinstance(rt, dict)
+                    and lt.get("signal_candle_ms") == rt.get("signal_candle_ms")
+                    and not lt.get("exit_alert_sent", True)
+                    and rt.get("exit_alert_sent") is True
+                ):
+                    lt["exit_alert_sent"] = True
+                    dirty = True
 
     r_touch = remote.get("last_touch_alerts")
     if isinstance(r_touch, dict):
@@ -290,9 +385,11 @@ def _fetch_binance_public_json(path_and_query, timeout=10, retries=2):
     raise last_err
 
 
-def _fetch_binance_klines(interval, limit):
+def _fetch_binance_klines(interval, limit, start_time_ms=None):
     """Fetch spot klines from Binance public API in chronological order."""
     path = f"/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={int(limit)}"
+    if start_time_ms is not None:
+        path += f"&startTime={int(start_time_ms)}"
     try:
         raw = _fetch_binance_public_json(path, timeout=10, retries=2)
         candles = []
@@ -318,9 +415,9 @@ def fetch_binance_daily_candles(limit=250):
     return _fetch_binance_klines("1d", limit)
 
 
-def fetch_binance_5m_candles(limit=40):
+def fetch_binance_5m_candles(limit=40, start_time_ms=None):
     """Fetch 5-minute candles from Binance Spot public API in chronological order."""
-    return _fetch_binance_klines("5m", limit)
+    return _fetch_binance_klines("5m", limit, start_time_ms=start_time_ms)
 
 
 _BINANCE_1H_CACHE = {"ts": 0.0, "hour_bucket": -1, "limit": 0, "candles": None}
@@ -380,24 +477,35 @@ def fetch_binance_24h_ticker():
         return None
 
 
-def partition_candles(candles, now_ms=None):
+def partition_candles(candles, now_ms=None, clock_skew_ms=2000):
     """Split candles strictly into closed valid bars vs forming open bar (QIS-7 Closed Candle Rule)."""
     if now_ms is None:
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - max(0, int(clock_skew_ms))
     closed = []
     forming = []
-    for c in sorted(candles, key=lambda x: x["open_time_ms"]):
-        if c["close_time_ms"] < now_ms:
-            if c["volume"] > 0 and c["low"] > 0 and c["close"] > 0:
+    for c in sorted((candles or []), key=lambda x: _safe_int(x.get("open_time_ms", 0), 0)):
+        o = _safe_float(c.get("open", 0.0), 0.0)
+        h = _safe_float(c.get("high", 0.0), 0.0)
+        l = _safe_float(c.get("low", 0.0), 0.0)
+        cl = _safe_float(c.get("close", 0.0), 0.0)
+        vol = _safe_float(c.get("volume", -1.0), -1.0)
+        close_ms = _safe_int(c.get("close_time_ms", 0), 0)
+        valid_ohlc = (
+            l > 0.0 and o > 0.0 and cl > 0.0 and h > 0.0 and vol >= 0.0
+        )
+        if not valid_ohlc:
+            continue
+        if close_ms < now_ms:
+            if vol > 0.0:
                 closed.append(c)
         else:
             forming.append(c)
     return closed, forming
 
 
-def partition_daily_candles(candles, now_ms=None):
+def partition_daily_candles(candles, now_ms=None, clock_skew_ms=2000):
     """Split daily candles strictly into closed valid bars vs forming open bar (QIS-7 Closed Candle Rule)."""
-    return partition_candles(candles, now_ms=now_ms)
+    return partition_candles(candles, now_ms=now_ms, clock_skew_ms=clock_skew_ms)
 
 
 def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
@@ -406,19 +514,19 @@ def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
     is_hybrid = strategy in ("daily_sma40_hybrid", "daily_sma40_volume_c", "daily_sma_hybrid", "model_c")
 
     if is_hybrid:
-        bull_sma_len = int(config.get("bull_sma_len", 40))
-        bear_sma_len = int(config.get("bear_sma_len", 40))
-        regime_sma_len = int(config.get("regime_sma_len", 200))
-        bull_vol_mult = float(config.get("bull_vol_mult", 1.2))
-        bull_vol_ma = int(config.get("bull_vol_ma", 20))
-        bear_vol_mult = float(config.get("bear_vol_mult", 1.8))
-        bear_vol_ma = int(config.get("bear_vol_ma", 5))
+        bull_sma_len = max(1, _safe_int(config.get("bull_sma_len", 40), 40))
+        bear_sma_len = max(1, _safe_int(config.get("bear_sma_len", 40), 40))
+        regime_sma_len = max(2, _safe_int(config.get("regime_sma_len", 200), 200))
+        bull_vol_mult = max(0.0, _safe_float(config.get("bull_vol_mult", 1.2), 1.2))
+        bull_vol_ma = max(1, _safe_int(config.get("bull_vol_ma", 20), 20))
+        bear_vol_mult = max(0.0, _safe_float(config.get("bear_vol_mult", 1.8), 1.8))
+        bear_vol_ma = max(1, _safe_int(config.get("bear_vol_ma", 5), 5))
     else:
-        sma_len = int(config.get("strategy_sma", 44))
+        sma_len = max(1, _safe_int(config.get("strategy_sma", 44), 44))
         bull_sma_len = bear_sma_len = sma_len
-        regime_sma_len = int(config.get("regime_sma_len", 200))
-        bull_vol_mult = bear_vol_mult = float(config.get("volume_multiplier", 1.2))
-        bull_vol_ma = bear_vol_ma = int(config.get("volume_ma_len", 20))
+        regime_sma_len = max(2, _safe_int(config.get("regime_sma_len", 200), 200))
+        bull_vol_mult = bear_vol_mult = max(0.0, _safe_float(config.get("volume_multiplier", 1.2), 1.2))
+        bull_vol_ma = bear_vol_ma = max(1, _safe_int(config.get("volume_ma_len", 20), 20))
 
     min_needed = max(bull_sma_len, bear_sma_len, bull_vol_ma + 1, bear_vol_ma + 1)
     if len(closed_candles) < min_needed:
@@ -509,143 +617,169 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
     chat_id = config.get("chat_id")
 
     if candles is None:
-        candles = fetch_binance_daily_candles(limit=250)
+        candles = fetch_binance_daily_candles(limit=_required_daily_limit(config))
     closed, forming = partition_daily_candles(candles, now_ms=now_ms)
     if not closed:
         print("Not enough closed daily candles fetched from Binance.")
         return state, "캔들 데이터 부족"
 
-    prev_pos = state.get("position", "CASH")
-    try:
-        snap = compute_live_signal_snapshot(closed, config, prev_pos=prev_pos)
-    except ValueError as e:
-        print(f"Signal computation error: {e}")
-        return state, str(e)
+    prev_eval_ms = _safe_int(state.get("last_evaluated_candle_ms", 0), 0)
+    latest_closed_ms = int(closed[-1]["open_time_ms"])
+    if prev_eval_ms > 0:
+        pending_indices = [k for k, c in enumerate(closed) if int(c["open_time_ms"]) > prev_eval_ms]
+    else:
+        pending_indices = [len(closed) - 1]
+    is_new_daily_close = bool(pending_indices)
 
-    completed_candle = snap["completed_candle"]
-    last_evaluated_ms = completed_candle["open_time_ms"]
-    is_new_daily_close = (last_evaluated_ms != state.get("last_evaluated_candle_ms", 0))
-
-    if forming and forming[0]["open_time_ms"] == completed_candle["close_time_ms"] + 1:
-        fill_price = forming[0]["open"]
-        current_price = forming[-1]["close"]
+    if forming and forming[0]["open_time_ms"] == closed[-1]["close_time_ms"] + 1:
+        latest_fill_price = _pick_positive_price(forming[0].get("open"), closed[-1].get("close"))
+        current_price = _pick_positive_price(forming[-1].get("close"), latest_fill_price)
     else:
         ticker_p = fetch_binance_ticker_price()
-        fill_price = ticker_p or completed_candle["close"]
-        current_price = fill_price
+        latest_fill_price = _pick_positive_price(ticker_p, closed[-1].get("close"))
+        current_price = latest_fill_price
 
-    completed_date_str = datetime.fromtimestamp(last_evaluated_ms / 1000, timezone.utc).strftime("%Y-%m-%d")
     trade_executed = False
-    trade_info = None
+    snap = None
 
-    # Execute position transition only once per newly closed daily candle (prevents intraday /check desync).
-    if is_new_daily_close:
-        state["last_evaluated_candle_ms"] = last_evaluated_ms
-        target_pos = snap["target_pos"]
-        state["last_signal"] = target_pos
+    if not is_new_daily_close:
+        try:
+            snap = compute_live_signal_snapshot(closed, config, prev_pos=state.get("position", "CASH"))
+        except ValueError as e:
+            print(f"Signal computation error: {e}")
+            return state, str(e)
+    else:
+        # Replay every un-evaluated closed daily candle chronologically (prevents missed signals after multi-day outages).
+        for step_pos, k in enumerate(pending_indices):
+            prev_pos = state.get("position", "CASH")
+            try:
+                step_snap = compute_live_signal_snapshot(closed[:k + 1], config, prev_pos=prev_pos)
+            except ValueError as e:
+                if step_pos == len(pending_indices) - 1 and snap is None:
+                    print(f"Signal computation error: {e}")
+                    return state, str(e)
+                continue
 
-        if prev_pos != target_pos:
-            if target_pos == "BTC":
-                cash = float(state.get("cash", config.get("initial_seed_usdt", 10000.0)))
-                buy_fill = fill_price * (1.0 + slip_rate)
-                qty = cash / (buy_fill * (1.0 + fee_rate))
-                fee = qty * buy_fill * fee_rate
-                state["cash"] = 0.0
-                state["btc_qty"] = qty
-                state["cost_basis"] = cash
-                state["position"] = "BTC"
-                state["entry_price"] = buy_fill
-                state["entry_time_utc"] = datetime.now(timezone.utc).isoformat()
+            snap = step_snap
+            completed_candle = snap["completed_candle"]
+            last_evaluated_ms = int(completed_candle["open_time_ms"])
+            step_fill_price = float(closed[k + 1]["open"]) if (k + 1 < len(closed)) else float(latest_fill_price)
 
-                # Canonical Model C Combined rule: if an active 2h dip trade spans across daily BTC buy,
-                # carry it forward into the trend position without selling separately.
-                promoted_dip = None
-                daily_fill_open_ms = int(completed_candle["close_time_ms"]) + 1
-                open_dip = state.get("open_dip")
-                if isinstance(open_dip, dict) and int(open_dip.get("exit_open_ms", 0) or 0) > daily_fill_open_ms:
-                    dip_entry_ref = float(open_dip.get("entry_ref_price") or open_dip.get("entry_fill") or fill_price)
-                    handoff_ret_pct = ((fill_price / dip_entry_ref) - 1.0) * 100.0 if dip_entry_ref > 0 else 0.0
-                    promoted_dip = {
-                        "status": "PROMOTED_TO_TREND",
-                        "signal_candle_ms": open_dip.get("signal_candle_ms", 0),
-                        "entry_open_ms": open_dip.get("entry_open_ms", 0),
-                        "exit_open_ms": daily_fill_open_ms,
-                        "entry_time": open_dip.get("entry_time_utc", ""),
-                        "exit_time": datetime.fromtimestamp(daily_fill_open_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                        "entry_price": float(open_dip.get("entry_fill", dip_entry_ref)),
-                        "entry_ref_price": dip_entry_ref,
-                        "exit_price": float(fill_price),
-                        "exit_ref_price": float(fill_price),
-                        "pnl": 0.0,
-                        "pnl_pct": handoff_ret_pct,
-                        "drop_pct_actual": open_dip.get("drop_pct_actual"),
-                        "vol_ratio": open_dip.get("vol_ratio"),
-                        "reason": "모델 C 추세 승계 (매도 없이 전환)",
-                        "exit_alert_sent": True,
+            state["last_evaluated_candle_ms"] = last_evaluated_ms
+            target_pos = snap["target_pos"]
+            state["last_signal"] = target_pos
+
+            if prev_pos != target_pos:
+                if target_pos == "BTC":
+                    cash = float(state.get("cash", config.get("initial_seed_usdt", 10000.0)))
+                    buy_fill = step_fill_price * (1.0 + slip_rate)
+                    qty = cash / (buy_fill * (1.0 + fee_rate))
+                    fee = qty * buy_fill * fee_rate
+                    state["cash"] = 0.0
+                    state["btc_qty"] = qty
+                    state["cost_basis"] = cash
+                    state["position"] = "BTC"
+                    state["entry_price"] = buy_fill
+                    state["entry_time_utc"] = datetime.now(timezone.utc).isoformat()
+
+                    # Canonical Model C Combined rule: if an active 2h dip trade spans across or expires at
+                    # daily BTC buy open (exit_open_ms >= daily_fill_open_ms), promote into trend without selling.
+                    promoted_dip = None
+                    daily_fill_open_ms = int(completed_candle["close_time_ms"]) + 1
+                    open_dip = state.get("open_dip")
+                    if isinstance(open_dip, dict) and _safe_int(open_dip.get("exit_open_ms", 0), 0) >= daily_fill_open_ms:
+                        dip_entry_ref = float(open_dip.get("entry_ref_price") or open_dip.get("entry_fill") or step_fill_price)
+                        handoff_ret_pct = ((step_fill_price / dip_entry_ref) - 1.0) * 100.0 if dip_entry_ref > 0 else 0.0
+                        promoted_dip = {
+                            "status": "PROMOTED_TO_TREND",
+                            "signal_candle_ms": open_dip.get("signal_candle_ms", 0),
+                            "entry_open_ms": open_dip.get("entry_open_ms", 0),
+                            "exit_open_ms": daily_fill_open_ms,
+                            "entry_time": open_dip.get("entry_time_utc", ""),
+                            "exit_time": datetime.fromtimestamp(daily_fill_open_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                            "entry_price": float(open_dip.get("entry_fill", dip_entry_ref)),
+                            "entry_ref_price": dip_entry_ref,
+                            "exit_price": float(step_fill_price),
+                            "exit_ref_price": float(step_fill_price),
+                            "pnl": 0.0,
+                            "pnl_pct": handoff_ret_pct,
+                            "drop_pct_actual": open_dip.get("drop_pct_actual"),
+                            "vol_ratio": open_dip.get("vol_ratio"),
+                            "reason": "모델 C 추세 승계 (매도 없이 전환)",
+                            "exit_alert_sent": True,
+                        }
+                        state.setdefault("dip_trades", []).append(promoted_dip)
+                        if open_dip.get("cost_basis"):
+                            state["dip_cash"] = float(open_dip["cost_basis"])
+                        state["open_dip"] = None
+
+                    trade_executed = True
+                    trade_info = {
+                        "action": "매수 (BUY)",
+                        "price": buy_fill,
+                        "reference_price": step_fill_price,
+                        "qty": qty,
+                        "fee": fee,
+                        "regime": snap["regime_label"],
+                        "vol_ratio": snap["vol_ratio"],
+                        "promoted_dip": promoted_dip,
+                        "reason": (
+                            f"{snap['active_sma_len']}일선 돌파 & 거래량 {snap['vol_ratio']:.2f}배 "
+                            f"(>= {snap['vol_mult']}배, {snap['regime_label']})"
+                        ),
+                        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     }
-                    state.setdefault("dip_trades", []).append(promoted_dip)
-                    if open_dip.get("cost_basis"):
-                        state["dip_cash"] = float(open_dip["cost_basis"])
-                    state["open_dip"] = None
+                    state["trades"].append(trade_info)
+                else:
+                    qty = float(state.get("btc_qty", 0.0))
+                    sell_fill = step_fill_price * (1.0 - slip_rate)
+                    gross_cash = qty * sell_fill
+                    fee = gross_cash * fee_rate
+                    net_cash = gross_cash - fee
+                    entry_p = float(state.get("entry_price", 0.0))
+                    cost_basis = float(state.get("cost_basis") or (qty * entry_p * (1.0 + fee_rate)))
+                    pnl = net_cash - cost_basis
+                    pnl_pct = (pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
 
-                trade_executed = True
-                trade_info = {
-                    "action": "매수 (BUY)",
-                    "price": buy_fill,
-                    "reference_price": fill_price,
-                    "qty": qty,
-                    "fee": fee,
-                    "regime": snap["regime_label"],
-                    "vol_ratio": snap["vol_ratio"],
-                    "promoted_dip": promoted_dip,
-                    "reason": (
-                        f"{snap['active_sma_len']}일선 돌파 & 거래량 {snap['vol_ratio']:.2f}배 "
-                        f"(>= {snap['vol_mult']}배, {snap['regime_label']})"
-                    ),
-                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                }
-                state["trades"].append(trade_info)
-            else:
-                qty = float(state.get("btc_qty", 0.0))
-                sell_fill = fill_price * (1.0 - slip_rate)
-                gross_cash = qty * sell_fill
-                fee = gross_cash * fee_rate
-                net_cash = gross_cash - fee
-                entry_p = float(state.get("entry_price", 0.0))
-                cost_basis = float(state.get("cost_basis") or (qty * entry_p * (1.0 + fee_rate)))
-                pnl = net_cash - cost_basis
-                pnl_pct = (pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+                    state["cash"] = net_cash
+                    state["btc_qty"] = 0.0
+                    state["cost_basis"] = 0.0
+                    state["position"] = "CASH"
+                    state["entry_price"] = 0.0
+                    state["entry_time_utc"] = ""
+                    trade_executed = True
+                    trade_info = {
+                        "action": "매도 (SELL)",
+                        "price": sell_fill,
+                        "reference_price": step_fill_price,
+                        "qty": qty,
+                        "fee": fee,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "regime": snap["regime_label"],
+                        "vol_ratio": snap["vol_ratio"],
+                        "reason": f"{snap['active_sma_len']}일선 하향 이탈 청산",
+                        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    }
+                    state["trades"].append(trade_info)
 
-                state["cash"] = net_cash
-                state["btc_qty"] = 0.0
-                state["cost_basis"] = 0.0
-                state["position"] = "CASH"
-                state["entry_price"] = 0.0
-                state["entry_time_utc"] = ""
-                trade_executed = True
-                trade_info = {
-                    "action": "매도 (SELL)",
-                    "price": sell_fill,
-                    "reference_price": fill_price,
-                    "qty": qty,
-                    "fee": fee,
-                    "pnl": pnl,
-                    "pnl_pct": pnl_pct,
-                    "regime": snap["regime_label"],
-                    "vol_ratio": snap["vol_ratio"],
-                    "reason": f"{snap['active_sma_len']}일선 하향 이탈 청산",
-                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                }
-                state["trades"].append(trade_info)
+                save_state(state, state_path=state_path)
+                msg = format_trade_alert(config, state, trade_info, snap)
+                send_telegram_message(token, chat_id, msg)
 
-            save_state(state, state_path=state_path)
-            msg = format_trade_alert(config, state, trade_info, snap)
-            send_telegram_message(token, chat_id, msg)
-        else:
+            step_date_str = datetime.fromtimestamp(last_evaluated_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+            _record_oos_daily_point(state, step_date_str, float(snap["last_close"]))
+
+        if snap is None:
+            return state, "캔들 데이터 부족"
+        if not trade_executed:
             save_state(state, state_path=state_path)
             if not manual_check and config.get("enable_daily_report", True):
+                completed_date_str = datetime.fromtimestamp(latest_closed_ms / 1000, timezone.utc).strftime("%Y-%m-%d")
                 msg = format_daily_briefing(config, state, current_price, completed_date_str, snap)
                 send_telegram_message(token, chat_id, msg)
+        else:
+            save_state(state, state_path=state_path)
 
     return state, {
         "current_price": current_price,
@@ -728,8 +862,27 @@ def format_daily_briefing(config, state, price, date_str, snap):
 • <b>잔고:</b> ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)"""
 
 
+def _resolve_touch_sma_lens(config, closed):
+    """Resolve active SMA length, regime SMA length, and required volume multiplier from strategy config."""
+    strategy = config.get("strategy_name", "daily_sma40_hybrid")
+    is_hybrid = strategy in ("daily_sma40_hybrid", "daily_sma40_volume_c", "daily_sma_hybrid", "model_c")
+    regime_len = max(2, _safe_int(config.get("regime_sma_len", 200), 200))
+    closes = [float(c["close"]) for c in closed]
+    sma_regime = (sum(closes[-regime_len:]) / float(regime_len)) if len(closes) >= regime_len else None
+    is_bull = (sma_regime is not None) and (closes[-1] > sma_regime)
+    if is_hybrid:
+        bull_len = max(1, _safe_int(config.get("bull_sma_len", 40), 40))
+        bear_len = max(1, _safe_int(config.get("bear_sma_len", 40), 40))
+        active_len = bull_len if is_bull else bear_len
+        req_mult = _safe_float(config.get("bull_vol_mult", 1.2), 1.2) if is_bull else _safe_float(config.get("bear_vol_mult", 1.8), 1.8)
+    else:
+        active_len = max(1, _safe_int(config.get("strategy_sma", 44), 44))
+        req_mult = _safe_float(config.get("volume_multiplier", 1.2), 1.2)
+    return active_len, regime_len, sma_regime, is_bull, req_mult
+
+
 def check_sma_touch_alert(config, state, state_path=STATE_PATH):
-    """Check if real-time BTC price approaches active trading SMA (40d) or regime SMA (200d)."""
+    """Check if real-time BTC price approaches active trading SMA or regime SMA."""
     if not config.get("touch_alert_enabled", True):
         return None
     token = config.get("bot_token")
@@ -741,27 +894,26 @@ def check_sma_touch_alert(config, state, state_path=STATE_PATH):
     if not cur_price:
         return None
 
-    candles = fetch_binance_daily_candles(limit=250)
+    candles = fetch_binance_daily_candles(limit=_required_daily_limit(config))
     closed, _ = partition_daily_candles(candles)
-    if len(closed) < 40:
+    if not closed:
         return None
 
-    closes = [c["close"] for c in closed]
-    active_len = int(config.get("bull_sma_len", config.get("strategy_sma", 40)))
-    regime_len = int(config.get("regime_sma_len", 200))
-    sma_active = sum(closes[-active_len:]) / float(active_len)
-    sma_regime = sum(closes[-regime_len:]) / float(regime_len) if len(closes) >= regime_len else None
+    active_len, regime_len, sma_regime, is_bull, req_mult = _resolve_touch_sma_lens(config, closed)
+    if len(closed) < active_len:
+        return None
 
-    threshold_pct = float(config.get("touch_threshold_pct", 0.5))
-    cooldown_sec = float(config.get("touch_cooldown_sec", 7200))
+    closes = [float(c["close"]) for c in closed]
+    sma_active = sum(closes[-active_len:]) / float(active_len)
+
+    threshold_pct = _safe_float(config.get("touch_threshold_pct", 0.5), 0.5)
+    cooldown_sec = _safe_float(config.get("touch_cooldown_sec", 7200), 7200.0)
     now_ts = time.time()
     last_alerts = state.setdefault("last_touch_alerts", {})
     alert_sent = False
 
     diff_active = abs(cur_price - sma_active) / sma_active * 100.0
-    if diff_active <= threshold_pct and (now_ts - last_alerts.get("sma_active", 0) > cooldown_sec):
-        is_bull = sma_regime is not None and cur_price > sma_regime
-        req_mult = config.get("bull_vol_mult", 1.2) if is_bull else config.get("bear_vol_mult", 1.8)
+    if diff_active <= threshold_pct and (now_ts - _safe_float(last_alerts.get("sma_active", 0), 0.0) > cooldown_sec):
         pos_now = state.get("position", "CASH")
         if pos_now == "BTC":
             header = f"🟠 [매도 주의 · 관망] {active_len}일선 터치 (오차 {diff_active:.2f}%)"
@@ -780,7 +932,7 @@ def check_sma_touch_alert(config, state, state_path=STATE_PATH):
     diff_regime = None
     if sma_regime is not None:
         diff_regime = abs(cur_price - sma_regime) / sma_regime * 100.0
-        if diff_regime <= threshold_pct and (now_ts - last_alerts.get("sma_regime", 0) > cooldown_sec):
+        if diff_regime <= threshold_pct and (now_ts - _safe_float(last_alerts.get("sma_regime", 0), 0.0) > cooldown_sec):
             side_tag = "강세장" if cur_price >= sma_regime else "약세장"
             msg = f"""<b>🟡 [관망 · 체제선 접근] {regime_len}일선 터치 ({diff_regime:.2f}%)</b>
 • <b>현재가 / {regime_len}일선:</b> ${cur_price:,.2f} / ${sma_regime:,.2f}
@@ -801,23 +953,28 @@ def check_sma_touch_alert(config, state, state_path=STATE_PATH):
 
 
 def _compute_1h_baseline_vol(closed_1h, before_ms, days=14):
-    """Average hourly volume over the trailing `days` closed 1h bars strictly before `before_ms`."""
+    """Average hourly volume over the trailing continuous `days` closed 1h bars strictly before `before_ms`."""
     if not closed_1h:
         return None
-    prior = [float(c["volume"]) for c in closed_1h if int(c["close_time_ms"]) <= int(before_ms) and float(c.get("volume", 0)) > 0]
+    prior = sorted(
+        (c for c in closed_1h if int(c["close_time_ms"]) < int(before_ms) and float(c.get("volume", 0)) > 0),
+        key=lambda c: int(c["open_time_ms"]),
+    )
     need = int(days) * 24
-    if len(prior) < 24:
+    if len(prior) < need:
         return None
     window = prior[-need:]
-    return sum(window) / float(len(window))
+    if int(window[-1]["open_time_ms"]) - int(window[0]["open_time_ms"]) != (need - 1) * 3_600_000:
+        return None
+    return sum(float(c["volume"]) for c in window) / float(need)
 
 
-def compute_short_dip_snapshot(closed_5m, lookback_bars=24, drop_pct=4.5, scan_bars=1, vol_mult=1.0, closed_1h=None):
+def compute_short_dip_snapshot(closed_5m, lookback_bars=24, drop_pct=4.5, scan_bars=1, vol_mult=1.0, closed_1h=None, min_open_ms=None):
     """Evaluate causal 2h dip + volume climax condition across closed 5m candles."""
     if not closed_5m:
         raise ValueError("5분봉 마감 데이터가 부족합니다.")
-    lookback_bars = int(lookback_bars)
-    vol_mult = float(vol_mult)
+    lookback_bars = max(1, _safe_int(lookback_bars, 24))
+    vol_mult = _safe_float(vol_mult, 1.0)
     by_open = {int(c["open_time_ms"]): c for c in closed_5m}
 
     def _window_vol_ratio(idx, ref_bar):
@@ -825,44 +982,49 @@ def compute_short_dip_snapshot(closed_5m, lookback_bars=24, drop_pct=4.5, scan_b
             return None
         ref_open = int(ref_bar["open_time_ms"])
         bar_open = int(closed_5m[idx]["open_time_ms"])
-        recent_slice = [
-            c for c in closed_5m[max(0, idx - lookback_bars + 1):idx + 1]
-            if ref_open < int(c["open_time_ms"]) <= bar_open
-        ]
-        if not recent_slice:
+        window_start_ms = ref_open + BAR_5M_MS
+        recent_slice = closed_5m[idx + 1 - lookback_bars:idx + 1]
+        if (
+            len(recent_slice) != lookback_bars
+            or int(recent_slice[0]["open_time_ms"]) != window_start_ms
+            or int(recent_slice[-1]["open_time_ms"]) != bar_open
+        ):
             return None
         recent_vol = sum(float(c["volume"]) for c in recent_slice)
-        eff_bars = float(len(recent_slice))
+        eff_bars = float(lookback_bars)
         base_vol = None
-        if idx >= 4032 + lookback_bars:
-            prior = closed_5m[idx - lookback_bars + 1 - 4032:idx - lookback_bars + 1]
+        required = 4032 + lookback_bars
+        if idx + 1 >= required:
+            first_idx = idx + 1 - required
+            if bar_open - int(closed_5m[first_idx]["open_time_ms"]) != (required - 1) * BAR_5M_MS:
+                return None
+            prior = closed_5m[first_idx:idx + 1 - lookback_bars]
             base_vol = (sum(float(c["volume"]) for c in prior) / 4032.0) * eff_bars
         elif closed_1h:
-            hr_avg = _compute_1h_baseline_vol(closed_1h, ref_open, days=14)
+            hr_avg = _compute_1h_baseline_vol(closed_1h, window_start_ms, days=14)
             if hr_avg and hr_avg > 0:
                 base_vol = hr_avg * (eff_bars / 12.0)
-        else:
-            prior_5m = closed_5m[:max(0, idx - lookback_bars + 1)]
-            if len(prior_5m) >= 6:
-                base_vol = (sum(float(c["volume"]) for c in prior_5m) / float(len(prior_5m))) * eff_bars
         if base_vol and base_vol > 0:
             return recent_vol / base_vol
         return None
 
     latest = closed_5m[-1]
     latest_ref = by_open.get(int(latest["open_time_ms"]) - lookback_bars * BAR_5M_MS)
-    latest_ret_pct = ((latest["close"] / latest_ref["close"]) - 1.0) * 100.0 if latest_ref else None
+    latest_ret_pct = ((latest["close"] / latest_ref["close"]) - 1.0) * 100.0 if (latest_ref and latest_ref["close"] > 0) else None
     latest_vol_ratio = _window_vol_ratio(len(closed_5m) - 1, latest_ref) if latest_ref else None
 
-    threshold = -abs(float(drop_pct))
-    start_idx = max(0, len(closed_5m) - max(1, int(scan_bars)))
+    threshold = -abs(_safe_float(drop_pct, 4.5))
+    start_idx = max(0, len(closed_5m) - max(1, _safe_int(scan_bars, 1)))
     triggered_bar = None
     triggered_ref = None
     triggered_ret_pct = None
     triggered_vol_ratio = None
-    for idx in range(len(closed_5m) - 1, start_idx - 1, -1):
+    for idx in range(start_idx, len(closed_5m)):
         bar = closed_5m[idx]
-        ref = by_open.get(int(bar["open_time_ms"]) - lookback_bars * BAR_5M_MS)
+        bar_ms = int(bar["open_time_ms"])
+        if min_open_ms is not None and bar_ms <= int(min_open_ms):
+            continue
+        ref = by_open.get(bar_ms - lookback_bars * BAR_5M_MS)
         if not ref or ref["close"] <= 0:
             continue
         ret_pct = ((bar["close"] / ref["close"]) - 1.0) * 100.0
@@ -887,7 +1049,7 @@ def compute_short_dip_snapshot(closed_5m, lookback_bars=24, drop_pct=4.5, scan_b
         "triggered_ret_pct": triggered_ret_pct,
         "triggered_vol_ratio": triggered_vol_ratio,
         "lookback_bars": lookback_bars,
-        "drop_pct": float(drop_pct),
+        "drop_pct": _safe_float(drop_pct, 4.5),
         "vol_mult": vol_mult,
     }
 
@@ -963,17 +1125,75 @@ def _retry_unsent_dip_exits(config, state, state_path, cur_ms, token, chat_id):
     return retried_ok
 
 
+def _format_dip_entry_alert(config, open_dip, cur_ms, live_price):
+    lookback_bars = max(1, _safe_int(config.get("dip_alert_lookback_bars", 24), 24))
+    drop_pct = _safe_float(config.get("dip_alert_drop_pct", 4.5), 4.5)
+    vol_mult = _safe_float(config.get("dip_alert_vol_mult", 2.5), 2.5)
+    hold_bars = max(1, _safe_int(open_dip.get("hold_bars", config.get("dip_alert_hold_bars", 24)), 24))
+    lb_hours = lookback_bars * 5 / 60.0
+    hold_hours = hold_bars * 5 / 60.0
+    entry_open_ms = _safe_int(open_dip.get("entry_open_ms", 0), 0)
+    exit_open_ms = _safe_int(open_dip.get("exit_open_ms", 0), 0)
+    exit_utc = datetime.fromtimestamp(exit_open_ms / 1000.0, tz=timezone.utc)
+    exit_tor = exit_utc.astimezone(TORONTO_TZ)
+    lag_min = max(0, int((cur_ms - entry_open_ms) // 60000))
+    vr = open_dip.get("vol_ratio")
+    vol_note = f" · 거래량 <b>{float(vr):.2f}배</b>" if (vol_mult > 1.0 and vr is not None) else ""
+    vol_crit = f"·{vol_mult:g}x" if vol_mult > 1.0 else ""
+    lag_tag = f" ({lag_min}분 경과)" if lag_min >= 5 else ""
+    ret_pct = _safe_float(open_dip.get("drop_pct_actual", 0.0), 0.0)
+    price_disp = _pick_positive_price(live_price, open_dip.get("entry_live_price"), open_dip.get("entry_ref_price"))
+    return f"""<b>🟢 [매수 · {hold_hours:g}h 단타] 급락 반등 타점{lag_tag}</b>
+• <b>행동:</b> <b>BTC 단타 매수</b> (현금대기 전용 · {hold_hours:g}h 후 매도)
+• <b>현재가:</b> <b>${price_disp:,.2f}</b> (급락 <b>{ret_pct:+.2f}%</b>{vol_note})
+• <b>기준/청산:</b> {lb_hours:g}h -{drop_pct:g}%{vol_crit} · 예정 <b>{exit_tor.strftime('%H:%M %Z')}</b> ({exit_utc.strftime('%H:%M UTC')})"""
+
+
+def _retry_unsent_dip_entries(config, state, state_path, cur_ms, token, chat_id, live_price):
+    """Retry delivering an active open_dip entry notification that previously failed to send."""
+    if not token or not chat_id:
+        return False
+    open_dip = state.get("open_dip")
+    if not isinstance(open_dip, dict) or open_dip.get("entry_alert_sent", True):
+        return False
+    exit_open_ms = _safe_int(open_dip.get("exit_open_ms", 0), 0)
+    if exit_open_ms > 0 and cur_ms >= exit_open_ms:
+        return False
+    msg = _format_dip_entry_alert(config, open_dip, cur_ms, live_price)
+    if send_telegram_message(token, chat_id, msg):
+        open_dip["entry_alert_sent"] = True
+        state["last_dip_alert_ts"] = cur_ms / 1000.0
+        state["last_dip_alert_candle_ms"] = _safe_int(open_dip.get("signal_candle_ms", 0), 0)
+        save_state(state, state_path=state_path)
+        return True
+    return False
+
+
 def _settle_due_dip_trade(config, state, state_path, cur_ms, closed_5m, forming_5m, token, chat_id, allow_ticker=True):
     """Settle an active 2h short-dip paper trade once its canonical exit bar opens."""
     open_dip = state.get("open_dip")
     if not isinstance(open_dip, dict):
         return None
-    exit_open_ms = int(open_dip.get("exit_open_ms", 0) or 0)
+    exit_open_ms = _safe_int(open_dip.get("exit_open_ms", 0), 0)
     if exit_open_ms <= 0 or cur_ms < exit_open_ms:
         return None
 
     all_bars = sorted(closed_5m + forming_5m, key=lambda c: int(c["open_time_ms"]))
-    exit_bar = next((c for c in all_bars if int(c["open_time_ms"]) >= exit_open_ms and float(c.get("open", 0)) > 0), None)
+    exit_bar = None
+    if all_bars and int(all_bars[0]["open_time_ms"]) > exit_open_ms:
+        # Long outage pushed exit_open_ms outside the fetched 5m window: query exact bar at exit_open_ms.
+        if allow_ticker:
+            hist_bars = fetch_binance_5m_candles(limit=5, start_time_ms=exit_open_ms)
+            if hist_bars:
+                exit_bar = next(
+                    (c for c in sorted(hist_bars, key=lambda x: int(x["open_time_ms"]))
+                     if int(c["open_time_ms"]) >= exit_open_ms and _safe_float(c.get("open", 0), 0.0) > 0),
+                    None,
+                )
+        if exit_bar is None:
+            return None
+    else:
+        exit_bar = next((c for c in all_bars if int(c["open_time_ms"]) >= exit_open_ms and _safe_float(c.get("open", 0), 0.0) > 0), None)
     if exit_bar is not None:
         exit_ref_price = float(exit_bar["open"])
         actual_exit_ms = int(exit_bar["open_time_ms"])
@@ -981,9 +1201,12 @@ def _settle_due_dip_trade(config, state, state_path, cur_ms, closed_5m, forming_
         return None
     else:
         live_p = fetch_binance_ticker_price() if allow_ticker else None
-        if live_p is None:
-            live_p = float(forming_5m[-1]["close"] if forming_5m else closed_5m[-1]["close"])
-        exit_ref_price = float(live_p)
+        exit_ref_price = _pick_positive_price(
+            live_p,
+            forming_5m[-1].get("close") if forming_5m else None,
+            closed_5m[-1].get("close") if closed_5m else None,
+            open_dip.get("entry_ref_price"),
+        )
         actual_exit_ms = exit_open_ms
 
     fee_rate = float(config.get("fee_rate", 0.0015))
@@ -1094,6 +1317,32 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
             "exit_retried": exit_retried,
         }
 
+    # Retry unsent entry alert for an already-recorded open_dip (prevents ledger loss & delivers on recovery)
+    existing_open = state.get("open_dip")
+    if isinstance(existing_open, dict) and existing_open.get("entry_alert_sent") is False:
+        live_p_retry = _pick_positive_price(
+            fetch_binance_ticker_price() if candles_5m is None else None,
+            forming_5m[-1].get("close") if forming_5m else None,
+            closed_5m[-1].get("close") if closed_5m else None,
+            existing_open.get("entry_live_price"),
+        )
+        entry_retried = _retry_unsent_dip_entries(config, state, state_path, cur_ms, token, chat_id, live_p_retry)
+        return {
+            "checked": True,
+            "alert_sent": bool(entry_retried),
+            "entry_retried": bool(entry_retried),
+            "position": pos,
+            "triggered_ret_pct": existing_open.get("drop_pct_actual"),
+            "triggered_vol_ratio": existing_open.get("vol_ratio"),
+            "triggered_candle_ms": _safe_int(existing_open.get("signal_candle_ms", 0), 0),
+            "live_price": live_p_retry,
+            "open_dip": state.get("open_dip"),
+            "exit_settled": settled is not None,
+            "exit_alert_sent": bool(settled and settled.get("exit_alert_sent")),
+            "settled_trade": settled,
+            "exit_retried": exit_retried,
+        }
+
     raw_1h = candles_1h
     if raw_1h is None and candles_5m is None and vol_mult > 1.0:
         try:
@@ -1102,10 +1351,22 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
             raw_1h = None
     closed_1h, _ = partition_candles(raw_1h, now_ms=cur_ms) if raw_1h else ([], [])
 
-    snap = compute_short_dip_snapshot(
-        closed_5m, lookback_bars=lookback_bars, drop_pct=drop_pct, scan_bars=scan_bars,
-        vol_mult=vol_mult, closed_1h=closed_1h or None,
-    )
+    last_candle_ms = _safe_int(state.get("last_dip_alert_candle_ms", 0), 0)
+    if not isinstance(state.get("open_dip"), dict) and last_candle_ms > 0 and int(scan_bars) > 1:
+        snap = compute_short_dip_snapshot(
+            closed_5m, lookback_bars=lookback_bars, drop_pct=drop_pct, scan_bars=scan_bars,
+            vol_mult=vol_mult, closed_1h=closed_1h or None, min_open_ms=last_candle_ms,
+        )
+        if not snap["triggered"]:
+            snap = compute_short_dip_snapshot(
+                closed_5m, lookback_bars=lookback_bars, drop_pct=drop_pct, scan_bars=scan_bars,
+                vol_mult=vol_mult, closed_1h=closed_1h or None,
+            )
+    else:
+        snap = compute_short_dip_snapshot(
+            closed_5m, lookback_bars=lookback_bars, drop_pct=drop_pct, scan_bars=scan_bars,
+            vol_mult=vol_mult, closed_1h=closed_1h or None,
+        )
     if not snap["triggered"]:
         return {
             "checked": True,
@@ -1123,10 +1384,27 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
     trig_ref = snap["triggered_ref"]
     trig_ms = int(trig_bar["open_time_ms"])
     now_ts = cur_ms / 1000.0
-    last_ts = float(state.get("last_dip_alert_ts", 0.0) or 0.0)
-    last_candle_ms = int(state.get("last_dip_alert_candle_ms", 0) or 0)
+    last_ts = _safe_float(state.get("last_dip_alert_ts", 0.0), 0.0)
 
-    if trig_ms == last_candle_ms or (now_ts - last_ts <= cooldown_sec):
+    last_settled_exit_ms = 0
+    for rec in (state.get("dip_trades", []) or []):
+        if isinstance(rec, dict):
+            ex_ms = _safe_int(rec.get("exit_open_ms", 0), 0)
+            if ex_ms > last_settled_exit_ms:
+                last_settled_exit_ms = ex_ms
+
+    entry_open_ms = trig_ms + BAR_5M_MS
+    same_bar_reentry = last_settled_exit_ms > 0 and entry_open_ms <= last_settled_exit_ms
+    if last_candle_ms > 0:
+        in_cooldown = (
+            trig_ms <= last_candle_ms
+            or same_bar_reentry
+            or (cooldown_sec > 0 and (trig_ms - last_candle_ms) <= int(cooldown_sec * 1000))
+        )
+    else:
+        in_cooldown = same_bar_reentry or (last_ts > 0 and cooldown_sec > 0 and (now_ts - last_ts) <= cooldown_sec)
+
+    if in_cooldown:
         return {
             "checked": True,
             "alert_sent": False,
@@ -1166,61 +1444,57 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
             "exit_retried": exit_retried,
         }
 
-    live_price = fetch_binance_ticker_price() if candles_5m is None else None
-    if live_price is None:
-        live_price = forming_5m[-1]["close"] if forming_5m else trig_bar["close"]
+    live_price = _pick_positive_price(
+        fetch_binance_ticker_price() if candles_5m is None else None,
+        forming_5m[-1].get("close") if forming_5m else None,
+        trig_bar.get("close"),
+    )
 
-    lb_hours = lookback_bars * 5 / 60.0
-    hold_hours = hold_bars * 5 / 60.0
-    entry_open_ms = trig_ms + BAR_5M_MS
     exit_open_ms = entry_open_ms + hold_bars * BAR_5M_MS
     all_5m_by_open = {int(c["open_time_ms"]): c for c in (closed_5m + forming_5m)}
     entry_bar = all_5m_by_open.get(entry_open_ms)
-    entry_ref_price = float(entry_bar["open"]) if (entry_bar and float(entry_bar.get("open", 0)) > 0) else float(live_price)
+    entry_ref_price = _pick_positive_price(
+        entry_bar.get("open") if entry_bar else None,
+        live_price,
+    )
 
-    fee_rate = float(config.get("fee_rate", 0.0015))
-    slip_rate = float(config.get("slippage_rate", 0.0005))
+    fee_rate = _safe_float(config.get("fee_rate", 0.0015), 0.0015)
+    slip_rate = _safe_float(config.get("slippage_rate", 0.0005), 0.0005)
     entry_fill = entry_ref_price * (1.0 + slip_rate)
-    dip_seed = float(state.get("dip_initial_seed") or config.get("initial_seed_usdt", 10000.0))
-    dip_cash = float(state.get("dip_cash", dip_seed) if state.get("dip_cash") is not None else dip_seed)
+    dip_seed = _safe_float(state.get("dip_initial_seed") or config.get("initial_seed_usdt", 10000.0), 10000.0)
+    dip_cash = _safe_float(state.get("dip_cash", dip_seed) if state.get("dip_cash") is not None else dip_seed, dip_seed)
     dip_qty = dip_cash / (entry_fill * (1.0 + fee_rate)) if (entry_fill > 0 and dip_cash > 0) else 0.0
     entry_fee = dip_qty * entry_fill * fee_rate
-
     entry_utc = datetime.fromtimestamp(entry_open_ms / 1000.0, tz=timezone.utc)
-    exit_utc = datetime.fromtimestamp(exit_open_ms / 1000.0, tz=timezone.utc)
-    entry_tor = entry_utc.astimezone(TORONTO_TZ)
-    exit_tor = exit_utc.astimezone(TORONTO_TZ)
-    lag_min = max(0, int((cur_ms - entry_open_ms) // 60000))
     vr = snap["triggered_vol_ratio"]
-    vol_note = f" · 거래량 <b>{vr:.2f}배</b>" if (vol_mult > 1.0 and vr is not None) else ""
-    vol_crit = f"·{vol_mult:g}x" if vol_mult > 1.0 else ""
-    lag_tag = f" ({lag_min}분 경과)" if lag_min >= 5 else ""
 
-    msg = f"""<b>🟢 [매수 · {hold_hours:g}h 단타] 급락 반등 타점{lag_tag}</b>
-• <b>행동:</b> <b>BTC 단타 매수</b> (현금대기 전용 · {hold_hours:g}h 후 매도)
-• <b>현재가:</b> <b>${live_price:,.2f}</b> (급락 <b>{snap['triggered_ret_pct']:+.2f}%</b>{vol_note})
-• <b>기준/청산:</b> {lb_hours:g}h -{drop_pct:g}%{vol_crit} · 예정 <b>{exit_tor.strftime('%H:%M %Z')}</b> ({exit_utc.strftime('%H:%M UTC')})"""
+    new_open_dip = {
+        "signal_candle_ms": trig_ms,
+        "entry_open_ms": entry_open_ms,
+        "exit_open_ms": exit_open_ms,
+        "hold_bars": hold_bars,
+        "entry_ref_price": entry_ref_price,
+        "entry_live_price": float(live_price),
+        "entry_fill": entry_fill,
+        "qty": dip_qty,
+        "cost_basis": dip_cash,
+        "entry_fee": entry_fee,
+        "drop_pct_actual": float(snap["triggered_ret_pct"]),
+        "vol_ratio": float(vr) if vr is not None else None,
+        "entry_time_utc": entry_utc.strftime("%Y-%m-%d %H:%M UTC"),
+        "entry_alert_sent": False,
+    }
+    if cur_ms < exit_open_ms:
+        state["open_dip"] = new_open_dip
+        save_state(state, state_path=state_path)
 
+    msg = _format_dip_entry_alert(config, new_open_dip, cur_ms, live_price)
     sent = send_telegram_message(token, chat_id, msg)
     if sent:
         state["last_dip_alert_ts"] = now_ts
         state["last_dip_alert_candle_ms"] = trig_ms
-        if cur_ms < exit_open_ms:
-            state["open_dip"] = {
-                "signal_candle_ms": trig_ms,
-                "entry_open_ms": entry_open_ms,
-                "exit_open_ms": exit_open_ms,
-                "hold_bars": hold_bars,
-                "entry_ref_price": entry_ref_price,
-                "entry_live_price": float(live_price),
-                "entry_fill": entry_fill,
-                "qty": dip_qty,
-                "cost_basis": dip_cash,
-                "entry_fee": entry_fee,
-                "drop_pct_actual": float(snap["triggered_ret_pct"]),
-                "vol_ratio": float(vr) if vr is not None else None,
-                "entry_time_utc": entry_utc.strftime("%Y-%m-%d %H:%M UTC"),
-            }
+        if isinstance(state.get("open_dip"), dict) and _safe_int(state["open_dip"].get("signal_candle_ms", 0), 0) == trig_ms:
+            state["open_dip"]["entry_alert_sent"] = True
         save_state(state, state_path=state_path)
 
     return {
@@ -1274,7 +1548,11 @@ def get_dip_status_text(config, state, now_ms=None, candles_5m=None, candles_1h=
     ref = snap["latest_ref"]
     ret_pct = snap["latest_ret_pct"]
     vol_ratio = snap["latest_vol_ratio"]
-    live_price = (fetch_binance_ticker_price() if candles_5m is None else None) or (forming_5m[-1]["close"] if forming_5m else latest["close"])
+    live_price = _pick_positive_price(
+        fetch_binance_ticker_price() if candles_5m is None else None,
+        forming_5m[-1].get("close") if forming_5m else None,
+        latest.get("close"),
+    )
     lb_hours = lookback_bars * 5 / 60.0
     hold_hours = hold_bars * 5 / 60.0
     vol_tag = f" (거래량 {vol_mult:g}x)" if vol_mult > 1.0 else ""
@@ -1282,15 +1560,17 @@ def get_dip_status_text(config, state, now_ms=None, candles_5m=None, candles_1h=
     open_dip = state.get("open_dip")
     open_block = ""
     if isinstance(open_dip, dict):
-        exit_open_ms = int(open_dip.get("exit_open_ms", 0) or 0)
-        rem_min = max(0, int((exit_open_ms - cur_ms) // 60000))
-        entry_ref = float(open_dip.get("entry_ref_price") or open_dip.get("entry_fill") or 0.0)
+        exit_open_ms = _safe_int(open_dip.get("exit_open_ms", 0), 0)
+        rem_min = max(0, int((exit_open_ms - cur_ms) // 60000)) if exit_open_ms > 0 else 0
+        entry_ref = _pick_positive_price(open_dip.get("entry_ref_price"), open_dip.get("entry_fill"))
         mtm_pct = ((live_price / entry_ref) - 1.0) * 100.0 if entry_ref > 0 else 0.0
-        exit_utc = datetime.fromtimestamp(exit_open_ms / 1000.0, tz=timezone.utc)
-        exit_tor = exit_utc.astimezone(TORONTO_TZ)
+        exit_tor_str = (
+            datetime.fromtimestamp(exit_open_ms / 1000.0, tz=timezone.utc).astimezone(TORONTO_TZ).strftime('%H:%M %Z')
+            if exit_open_ms > 0 else "시간 미정"
+        )
         header_action = f"🟢 [단타 매수 보유] 진행 중 (청산 약 {rem_min}분 뒤)"
         open_block = (
-            f"\n• <b>진입 → 청산:</b> ${entry_ref:,.0f} (<b>{mtm_pct:+.2f}%</b>) → {exit_tor.strftime('%H:%M %Z')} 매도"
+            f"\n• <b>진입 → 청산:</b> ${entry_ref:,.0f} (<b>{mtm_pct:+.2f}%</b>) → {exit_tor_str} 매도"
         )
     elif not enabled:
         header_action = "🟡 [관망 · 단타 꺼짐]"
@@ -1320,19 +1600,24 @@ def get_dip_status_text(config, state, now_ms=None, candles_5m=None, candles_1h=
 
 
 def get_touch_status_text(config):
-    candles = fetch_binance_daily_candles(limit=250)
+    candles = fetch_binance_daily_candles(limit=_required_daily_limit(config))
     closed, forming = partition_daily_candles(candles)
-    if len(closed) < 40:
+    if not closed:
         return "⚠️ 바이낸스 일봉 조회 실패 또는 데이터 부족"
 
-    closes = [c["close"] for c in closed]
-    cur_price = fetch_binance_ticker_price() or (forming[-1]["close"] if forming else closes[-1])
-    active_len = int(config.get("bull_sma_len", config.get("strategy_sma", 40)))
-    regime_len = int(config.get("regime_sma_len", 200))
-    sma_active = sum(closes[-active_len:]) / float(active_len)
-    sma_regime = sum(closes[-regime_len:]) / float(regime_len) if len(closes) >= regime_len else None
+    active_len, regime_len, sma_regime, _, _ = _resolve_touch_sma_lens(config, closed)
+    if len(closed) < active_len:
+        return "⚠️ 바이낸스 일봉 조회 실패 또는 데이터 부족"
 
-    threshold = float(config.get("touch_threshold_pct", 0.5))
+    closes = [float(c["close"]) for c in closed]
+    cur_price = _pick_positive_price(
+        fetch_binance_ticker_price(),
+        forming[-1].get("close") if forming else None,
+        closes[-1],
+    )
+    sma_active = sum(closes[-active_len:]) / float(active_len)
+
+    threshold = _safe_float(config.get("touch_threshold_pct", 0.5), 0.5)
     gap_a = (cur_price / sma_active - 1.0) * 100.0
     flag_a = "🚨 터치권!" if abs(gap_a) <= threshold else "관망"
     reg_line = ""
@@ -1347,7 +1632,7 @@ def get_touch_status_text(config):
 
 
 def get_current_status_text(config, state):
-    candles = fetch_binance_daily_candles(limit=250)
+    candles = fetch_binance_daily_candles(limit=_required_daily_limit(config))
     closed, forming = partition_daily_candles(candles)
     if not closed:
         return "⚠️ 바이낸스 시세 조회 실패"
@@ -1358,27 +1643,32 @@ def get_current_status_text(config, state):
     except ValueError as e:
         return f"⚠️ {e}"
 
-    current_price = fetch_binance_ticker_price() or (forming[-1]["close"] if forming else snap["last_close"])
+    current_price = _pick_positive_price(
+        fetch_binance_ticker_price(),
+        forming[-1].get("close") if forming else None,
+        snap["last_close"],
+    )
     sma = snap["active_sma"]
     sma_len = snap["active_sma_len"]
     diff_pct = (current_price / sma - 1.0) * 100.0
 
     pos = prev_pos
-    initial_seed = float(state.get("initial_seed", 10000.0))
-    cur_equity = float(state["cash"]) if pos == "CASH" else float(state["btc_qty"]) * current_price
+    initial_seed = _safe_float(state.get("initial_seed", 10000.0), 10000.0)
+    cur_equity = _safe_float(state.get("cash", 0.0), 0.0) if pos == "CASH" else _safe_float(state.get("btc_qty", 0.0), 0.0) * current_price
     total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
     vol_ok_txt = "✅충족" if snap["vol_ok"] else "미달"
 
-    dip_lb_h = int(config.get("dip_alert_lookback_bars", 24)) * 5 / 60.0
-    dip_drop = float(config.get("dip_alert_drop_pct", 4.5))
-    dip_vm = float(config.get("dip_alert_vol_mult", 2.5))
+    dip_lb_h = max(1, _safe_int(config.get("dip_alert_lookback_bars", 24), 24)) * 5 / 60.0
+    dip_drop = _safe_float(config.get("dip_alert_drop_pct", 4.5), 4.5)
+    dip_vm = _safe_float(config.get("dip_alert_vol_mult", 2.5), 2.5)
     dip_spec = f"{dip_lb_h:g}h -{dip_drop:g}% · {dip_vm:g}x" if dip_vm > 1.0 else f"{dip_lb_h:g}h -{dip_drop:g}%"
     open_dip = state.get("open_dip")
     if not config.get("dip_alert_enabled", True):
         dip_status_str = "꺼짐"
     elif isinstance(open_dip, dict):
-        exit_utc = datetime.fromtimestamp(int(open_dip.get("exit_open_ms", 0) or 0) / 1000.0, tz=timezone.utc)
-        dip_status_str = f"단타 보유 중 (청산 {exit_utc.strftime('%H:%M UTC')})"
+        ex_ms = _safe_int(open_dip.get("exit_open_ms", 0), 0)
+        ex_str = datetime.fromtimestamp(ex_ms / 1000.0, tz=timezone.utc).strftime('%H:%M UTC') if ex_ms > 0 else "시간 미정"
+        dip_status_str = f"단타 보유 중 (청산 {ex_str})"
     elif config.get("dip_alert_cash_only", True) and pos != "CASH":
         dip_status_str = "정지 (BTC 보유 중)"
     else:
@@ -1405,6 +1695,132 @@ def get_current_status_text(config, state):
 • <b>다음 기준:</b> {next_cond}
 • <b>단타 감시:</b> {dip_status_str}{dip_ledger_str}
 • <b>모의잔고:</b> ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)"""
+
+
+def _record_oos_daily_point(state, date_str, btc_price):
+    """Record daily unseen live-OOS equity snapshot for Model C paper account."""
+    p = _safe_float(btc_price, 0.0)
+    if p <= 0.0 or not date_str:
+        return
+    pos = state.get("position", "CASH")
+    cur_eq = _safe_float(state.get("cash", 0.0), 0.0) if pos == "CASH" else _safe_float(state.get("btc_qty", 0.0), 0.0) * p
+    if not state.get("oos_start_utc"):
+        state["oos_start_utc"] = f"{date_str}T00:00:00Z"
+    if _safe_float(state.get("oos_start_btc_price", 0.0), 0.0) <= 0.0:
+        state["oos_start_btc_price"] = round(p, 2)
+    if _safe_float(state.get("oos_start_equity", 0.0), 0.0) <= 0.0:
+        state["oos_start_equity"] = round(cur_eq if cur_eq > 0 else _safe_float(state.get("initial_seed", 10000.0), 10000.0), 2)
+    hist = state.setdefault("oos_equity_history", [])
+    if not isinstance(hist, list):
+        hist = []
+        state["oos_equity_history"] = hist
+    pt = {"date": str(date_str), "equity": round(cur_eq, 2), "btc_price": round(p, 2), "position": pos}
+    if hist and isinstance(hist[-1], dict) and hist[-1].get("date") == date_str:
+        hist[-1] = pt
+    else:
+        hist.append(pt)
+    if len(hist) > 1500:
+        del hist[:-1500]
+
+
+def compute_live_oos_scorecard(config, state, current_btc_price=None):
+    """Compute true unseen live forward-OOS scorecard separate from observed historical backtests."""
+    seed = _safe_float(state.get("oos_start_equity") or state.get("initial_seed") or config.get("initial_seed_usdt", 10000.0), 10000.0)
+    pos = state.get("position", "CASH")
+    cur_p = _pick_positive_price(
+        current_btc_price,
+        state.get("entry_price") if pos == "BTC" else None,
+        (state.get("oos_equity_history") or [{}])[-1].get("btc_price") if state.get("oos_equity_history") else None,
+        state.get("oos_start_btc_price"),
+    )
+    cur_eq = _safe_float(state.get("cash", seed), seed) if pos == "CASH" else (
+        _safe_float(state.get("btc_qty", 0.0), 0.0) * cur_p if cur_p > 0 else _safe_float(state.get("cost_basis", seed), seed)
+    )
+    model_c_ret = ((cur_eq / seed) - 1.0) * 100.0 if seed > 0 else 0.0
+
+    hist = state.get("oos_equity_history") if isinstance(state.get("oos_equity_history"), list) else []
+    eq_series = [seed] + [_safe_float(x.get("equity", seed), seed) for x in hist if isinstance(x, dict)]
+    eq_series.append(cur_eq)
+    peak = eq_series[0] if eq_series else seed
+    mdd = 0.0
+    for v in eq_series:
+        if v > peak:
+            peak = v
+        if peak > 0:
+            mdd = max(mdd, (peak - v) / peak)
+
+    trades = [t for t in (state.get("trades") or []) if isinstance(t, dict)]
+    closed_trades = [t for t in trades if "매도" in str(t.get("action", "")) or "SELL" in str(t.get("action", "")).upper()]
+    wins = sum(1 for t in closed_trades if _safe_float(t.get("pnl", 0.0), 0.0) > 0.0)
+    losses = len(closed_trades) - wins
+    wr = (wins / float(len(closed_trades)) * 100.0) if closed_trades else 0.0
+
+    start_utc = str(state.get("oos_start_utc") or "")
+    if not start_utc:
+        last_ms = _safe_int(state.get("last_evaluated_candle_ms", 0), 0)
+        if last_ms > 0:
+            start_utc = datetime.fromtimestamp((last_ms + 86_400_000) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            start_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+        days_elapsed = max(0.0, (datetime.now(timezone.utc) - start_dt).total_seconds() / 86400.0)
+    except ValueError:
+        days_elapsed = float(len(hist))
+
+    start_btc = _pick_positive_price(
+        state.get("oos_start_btc_price"),
+        hist[0].get("btc_price") if (hist and isinstance(hist[0], dict)) else None,
+        cur_p,
+    )
+    btc_bh_ret = ((cur_p / start_btc) - 1.0) * 100.0 if (start_btc > 0 and cur_p > 0) else 0.0
+    alpha_pct = model_c_ret - btc_bh_ret
+    dip_summary = summarize_dip_ledger(config, state)
+    sample_status = (
+        f"초기 미관측 OOS 관측 중 ({len(closed_trades)}/10거래 · 통계 판단 전)"
+        if len(closed_trades) < 10 else
+        f"실시간 미관측 OOS 누적 중 ({len(closed_trades)}거래)"
+    )
+
+    return {
+        "oos_start_utc": start_utc,
+        "days_elapsed": round(days_elapsed, 1),
+        "history_days": len(hist),
+        "position": pos,
+        "initial_equity": round(seed, 2),
+        "current_equity": round(cur_eq, 2),
+        "model_c_return_pct": round(model_c_ret, 2),
+        "model_c_mdd_pct": round(mdd * 100.0, 2),
+        "closed_trades": len(closed_trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(wr, 1),
+        "btc_start_price": round(start_btc, 2) if start_btc > 0 else None,
+        "btc_current_price": round(cur_p, 2) if cur_p > 0 else None,
+        "btc_bh_return_pct": round(btc_bh_ret, 2),
+        "alpha_vs_bh_pct": round(alpha_pct, 2),
+        "dip_summary": dip_summary,
+        "sample_status": sample_status,
+    }
+
+
+def get_oos_status_text(config, state, current_btc_price=None):
+    """Render true unseen live-OOS scorecard for Telegram /oos command."""
+    live_p = _pick_positive_price(current_btc_price, fetch_binance_ticker_price() if current_btc_price is None else None)
+    sc = compute_live_oos_scorecard(config, state, current_btc_price=live_p if live_p > 0 else None)
+    pos_txt = "BTC 100% 보유" if sc["position"] == "BTC" else "USDT 현금 대기"
+    btc_line = (
+        f"<b>{sc['btc_bh_return_pct']:+.2f}%</b> (${sc['btc_start_price']:,.0f} → ${sc['btc_current_price']:,.0f})"
+        if (sc["btc_start_price"] and sc["btc_current_price"]) else "기준가 대기 중"
+    )
+    dip = sc["dip_summary"]
+    return f"""<b>🧪 [실시간 미관측 OOS 점수판]</b>
+• <b>추적 시작:</b> {sc['oos_start_utc'][:10]} ({sc['days_elapsed']:.0f}일 경과 · {pos_txt})
+• <b>모델 C 실전 모의:</b> <b>{sc['model_c_return_pct']:+.2f}%</b> (${sc['current_equity']:,.0f} · MDD -{sc['model_c_mdd_pct']:.2f}%)
+• <b>동일기간 BTC 보유:</b> {btc_line} (알파 <b>{sc['alpha_vs_bh_pct']:+.2f}%p</b>)
+• <b>완료 거래:</b> {sc['closed_trades']}전 {sc['wins']}승 {sc['losses']}패 (승률 {sc['win_rate_pct']:.1f}%)
+• <b>2h 단타 참고:</b> {dip['closed_count']}전 {dip['wins']}승 {dip['losses']}패 ({dip['total_ret_pct']:+.2f}%)
+• <b>신뢰도 상태:</b> {sc['sample_status']}"""
 
 
 if __name__ == "__main__":

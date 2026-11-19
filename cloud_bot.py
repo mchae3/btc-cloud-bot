@@ -47,7 +47,16 @@ def run_cloud_monitor(state_path=STATE_PATH):
     if not str(config.get("bot_token", "")).strip() or not str(config.get("chat_id", "")).strip():
         print("⚠️ WARNING: BOT_TOKEN or CHAT_ID is empty! Set them in GitHub Settings -> Secrets and variables -> Actions.")
 
-    # 1. Real-time 40d/200d SMA Touch Alert (±0.5% threshold, 2h cooldown)
+    # 1. Closed UTC Daily Candle Strategy Evaluation & Execution FIRST (once per closed day)
+    # Ensures daily Model C BUY promotes any spanning/boundary open_dip to PROMOTED_TO_TREND before 2h dip exit settlement.
+    state, eval_info = evaluate_signal_and_step(config, state, manual_check=False, state_path=state_path)
+    if isinstance(eval_info, dict):
+        print(
+            f"Evaluated: new_close={eval_info.get('is_new_daily_close')} | "
+            f"pos={eval_info.get('position')} | traded={eval_info.get('trade_executed')}"
+        )
+
+    # 2. Real-time 40d/200d SMA Touch Alert (±0.5% threshold, 2h cooldown)
     touch_info = check_sma_touch_alert(config, state, state_path=state_path)
     if touch_info:
         print(
@@ -55,7 +64,7 @@ def run_cloud_monitor(state_path=STATE_PATH):
             f"Active SMA: ${touch_info['sma_active']:,.2f} ({touch_info['diff_active']:.2f}%)"
         )
 
-    # 1b. Idle-Cash Dedicated 2h -4.5% (2.5x vol) Dip Alert & 2h Exit Settlement (scan last 12 closed 5m bars = 1h buffer for cron jitter)
+    # 2b. Idle-Cash Dedicated 2h -4.5% (2.5x vol) Dip Alert & 2h Exit Settlement (scan last 12 closed 5m bars = 1h buffer for cron jitter)
     dip_info = check_dip_alert(config, state, state_path=state_path, scan_bars=12)
     if isinstance(dip_info, dict) and dip_info.get("checked"):
         ret_disp = f"{dip_info['latest_ret_pct']:+.2f}%" if dip_info.get("latest_ret_pct") is not None else f"{dip_info.get('triggered_ret_pct', 0):+.2f}%"
@@ -69,7 +78,7 @@ def run_cloud_monitor(state_path=STATE_PATH):
         suffix = " | exit_settled=True" if dip_info.get("exit_settled") else ""
         print(f"Cash-Only 2h Dip Monitor skipped: {dip_info['skipped_reason']}{suffix}")
 
-    # 1c. Optional one-shot 5m close status notification (via workflow_dispatch input or state flag)
+    # 2c. Optional one-shot 5m close status notification (via workflow_dispatch input or state flag)
     want_status_once = (
         os.environ.get("NOTIFY_STATUS", "").strip().lower() in ("1", "true", "yes")
         or bool(state.get("notify_next_5m_close"))
@@ -81,14 +90,6 @@ def run_cloud_monitor(state_path=STATE_PATH):
             if state.get("notify_next_5m_close"):
                 state["notify_next_5m_close"] = False
                 save_state(state, state_path=state_path)
-
-    # 2. Closed UTC Daily Candle Strategy Evaluation & Execution (once per closed day)
-    state, eval_info = evaluate_signal_and_step(config, state, manual_check=False, state_path=state_path)
-    if isinstance(eval_info, dict):
-        print(
-            f"Evaluated: new_close={eval_info.get('is_new_daily_close')} | "
-            f"pos={eval_info.get('position')} | traded={eval_info.get('trade_executed')}"
-        )
 
     # 3. Toronto Morning Briefing (Every day at or after 09:00 AM Toronto Time)
     today_toronto_str = now_toronto.strftime("%Y-%m-%d")
