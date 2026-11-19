@@ -149,7 +149,7 @@ def format_toronto_morning_preview(config, state):
 
     prev_pos = state.get("position", "CASH")
     try:
-        snap = compute_live_signal_snapshot(closed, config, prev_pos=prev_pos)
+        snap = compute_live_signal_snapshot(closed, config, prev_pos=prev_pos, prev_state=state)
     except ValueError as e:
         return f"⚠️ {e}"
 
@@ -196,14 +196,14 @@ def dispatch_command(text, config, state, state_path=STATE_PATH, config_path=CON
                 "• <code>/dip</code> 또는 <code>/급락</code>: ⚡ 현금대기 전용 급락 감시 현황 조회\n"
                 "• <code>/briefing</code> 또는 <code>/아침</code>: 🌅 토론토 모닝 브리핑 즉시 미리보기\n"
                 "• <code>/mode dip</code> / <code>/mode touch</code> / <code>/mode all</code>: 알림 모드 전환\n"
-                "• <code>/v2</code> / <code>/v2_2h</code> / <code>/v1</code>: 전략 프리셋 전환 (v2 24h 권장 / v2 2h / v1 원본)\n"
+                "• <code>/v3</code> / <code>/v3_airbag</code> / <code>/v2</code> / <code>/v2_2h</code> / <code>/v1</code>: 전략 프리셋 전환 (v3 듀얼커널 권장 / v3 에어백 / v2 / v1)\n"
                 "• <code>/check</code>: 바이낸스 일봉 즉시 재계산 및 신호 확인\n"
                 "• <code>/trades</code>: 최근 체결 내역 조회\n"
                 "• <code>/oos</code> 또는 <code>/성과</code>: 🧪 실시간 미관측 OOS 점수판 (BTC 보유 대비 알파)\n"
                 "• <code>/help</code>: 도움말"
             ), state
 
-        if cmd in ("/v2", "/v2_2h", "/v1"):
+        if cmd in ("/v3", "/v3_airbag", "/v2", "/v2_2h", "/v1"):
             preset_key = cmd.lstrip("/")
             label = apply_strategy_preset(config, preset_key)
             save_state(config, state_path=config_path)

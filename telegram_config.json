@@ -28,5 +28,9 @@
   "dip_alert_drop_pct": 10.0,
   "dip_alert_vol_mult": 1.5,
   "dip_alert_hold_bars": 288,
-  "dip_alert_cooldown_sec": 86400
+  "dip_alert_cooldown_sec": 86400,
+  "trend_kernel": "sma_donchian",
+  "vol_target_pct": 75.0,
+  "vol_lookback": 20,
+  "rebal_deadband_pct": 15.0
 }

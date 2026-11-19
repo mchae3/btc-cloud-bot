@@ -35,6 +35,10 @@ DEFAULT_CONFIG = {
     "bear_vol_mult": 1.8,
     "bear_vol_ma": 5,
     "exit_confirm_days": 1,       # 청산 이탈 확인 일수 (1=기존 즉시, 2=2일 연속 이탈 확인)
+    "trend_kernel": "sma",        # 추세 커널 ('sma'=단일 SMA, 'sma_donchian'=SMA+돈치안 중앙값 50:50)
+    "vol_target_pct": 0.0,        # 20일 실현 변동성 목표 연율 % (0=비활성 고정100%, 75=v3 에어백)
+    "vol_lookback": 20,           # 실현 변동성 계산 일수
+    "rebal_deadband_pct": 15.0,   # 비중 리밸런싱 데드밴드 (%)
     # Legacy fallback keys (used only if strategy_name is explicitly non-hybrid)
     "strategy_sma": 40,
     "volume_multiplier": 1.2,
@@ -50,16 +54,46 @@ DEFAULT_CONFIG = {
     "dip_alert_enabled": True,    # 현금대기 중 급락 반등 알림
     "dip_alert_cash_only": True,  # 모델 C 현금(CASH) 대기 상태일 때만 급락 알림 발송
     "dip_alert_bear_only": False, # True면 200일선 이하(약세장) 현금 구간에서만 단타 진입
-    "dip_alert_lookback_bars": 24,  # 24 × 5분 = 2시간 (v2: 288 = 24시간)
-    "dip_alert_drop_pct": 4.5,    # 급락 기준 % (v2: 10.0)
-    "dip_alert_vol_mult": 2.5,    # 직전 14일 평균 대비 투매 거래량 배수 필터 (1.0=미사용, v2: 1.5)
-    "dip_alert_hold_bars": 24,    # 보유 봉 수 (v2: 288 = 24시간)
-    "dip_alert_cooldown_sec": 7200  # 급락 알림 중복 방지 쿨다운 (v2: 86400 = 24시간)
+    "dip_alert_lookback_bars": 24,  # 24 × 5분 = 2시간 (v2/v3: 288 = 24시간)
+    "dip_alert_drop_pct": 4.5,    # 급락 기준 % (v2/v3: 10.0)
+    "dip_alert_vol_mult": 2.5,    # 직전 14일 평균 대비 투매 거래량 배수 필터 (1.0=미사용, v2/v3: 1.5)
+    "dip_alert_hold_bars": 24,    # 보유 봉 수 (v2/v3: 288 = 24시간)
+    "dip_alert_cooldown_sec": 7200  # 급락 알림 중복 방지 쿨다운 (v2/v3: 86400 = 24시간)
 }
 
 STRATEGY_PRESETS = {
+    "v3": {
+        "label": "👑 v3 메인 추천 (듀얼커널 SMA40+Donch40 · Vol75% · 2일확인 + 24h -10% · 1.5x · 약세전용)",
+        "trend_kernel": "sma_donchian",
+        "vol_target_pct": 75.0,
+        "vol_lookback": 20,
+        "rebal_deadband_pct": 15.0,
+        "exit_confirm_days": 2,
+        "dip_alert_bear_only": True,
+        "dip_alert_lookback_bars": 288,
+        "dip_alert_drop_pct": 10.0,
+        "dip_alert_vol_mult": 1.5,
+        "dip_alert_hold_bars": 288,
+        "dip_alert_cooldown_sec": 86400,
+    },
+    "v3_airbag": {
+        "label": "🛡️ v3 에어백 (모델C SMA40 · Vol75% · 2일확인 + 24h -10% · 1.5x · 약세전용)",
+        "trend_kernel": "sma",
+        "vol_target_pct": 75.0,
+        "vol_lookback": 20,
+        "rebal_deadband_pct": 15.0,
+        "exit_confirm_days": 2,
+        "dip_alert_bear_only": True,
+        "dip_alert_lookback_bars": 288,
+        "dip_alert_drop_pct": 10.0,
+        "dip_alert_vol_mult": 1.5,
+        "dip_alert_hold_bars": 288,
+        "dip_alert_cooldown_sec": 86400,
+    },
     "v2": {
-        "label": "🚀 v2 메인 추천 (모델C 2일확인 + 24h -10% · 1.5x · 24h · 약세전용)",
+        "label": "🚀 v2 메인 추천 (고정100% · 모델C 2일확인 + 24h -10% · 1.5x · 24h · 약세전용)",
+        "trend_kernel": "sma",
+        "vol_target_pct": 0.0,
         "exit_confirm_days": 2,
         "dip_alert_bear_only": True,
         "dip_alert_lookback_bars": 288,
@@ -70,6 +104,8 @@ STRATEGY_PRESETS = {
     },
     "v2_2h": {
         "label": "⚡ v2 고수익 2h (모델C 2일확인 + 2h -4.5% · 2.5x · 2h · 약세전용)",
+        "trend_kernel": "sma",
+        "vol_target_pct": 0.0,
         "exit_confirm_days": 2,
         "dip_alert_bear_only": True,
         "dip_alert_lookback_bars": 24,
@@ -80,6 +116,8 @@ STRATEGY_PRESETS = {
     },
     "v1": {
         "label": "📌 v1 기존 원본 (모델C 1일즉시 + 2h -4.5% · 2.5x · 2h · 전체)",
+        "trend_kernel": "sma",
+        "vol_target_pct": 0.0,
         "exit_confirm_days": 1,
         "dip_alert_bear_only": False,
         "dip_alert_lookback_bars": 24,
@@ -92,7 +130,7 @@ STRATEGY_PRESETS = {
 
 
 def apply_strategy_preset(config, preset_name):
-    """Apply a verified strategy preset (v2, v2_2h, v1) onto config dict without touching credentials."""
+    """Apply a verified strategy preset (v3, v3_airbag, v2, v2_2h, v1) onto config dict without touching credentials."""
     key = str(preset_name or "").strip().lower()
     if key not in STRATEGY_PRESETS:
         raise ValueError(f"지원하지 않는 프리셋입니다: {preset_name}")
@@ -561,10 +599,16 @@ def partition_daily_candles(candles, now_ms=None, clock_skew_ms=2000):
     return partition_candles(candles, now_ms=now_ms, clock_skew_ms=clock_skew_ms)
 
 
-def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
-    """Exact Model C (40/40 Hybrid + 200 SMA) or legacy single-SMA snapshot on closed daily bars."""
+def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH", prev_state=None):
+    """Exact Model C / v3 Dual-Kernel + Vol-Target snapshot on closed daily bars."""
     strategy = config.get("strategy_name", "daily_sma40_hybrid")
     is_hybrid = strategy in ("daily_sma40_hybrid", "daily_sma40_volume_c", "daily_sma_hybrid", "model_c")
+    trend_kernel = str(config.get("trend_kernel", "sma") or "sma").strip().lower()
+    if trend_kernel not in ("sma", "sma_donchian"):
+        trend_kernel = "sma"
+    vol_target_pct = max(0.0, _safe_float(config.get("vol_target_pct", 0.0), 0.0))
+    vol_lookback = max(2, _safe_int(config.get("vol_lookback", 20), 20))
+    rebal_deadband_pct = max(0.0, min(100.0, _safe_float(config.get("rebal_deadband_pct", 15.0), 15.0)))
 
     if is_hybrid:
         bull_sma_len = max(1, _safe_int(config.get("bull_sma_len", 40), 40))
@@ -586,10 +630,12 @@ def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
         raise ValueError(f"완료 일봉 부족: 최소 {min_needed}일 필요, 현재 {len(closed_candles)}일")
 
     completed_candle = closed_candles[-1]
-    closes = [c["close"] for c in closed_candles]
-    vols = [c["volume"] for c in closed_candles]
-    last_close = completed_candle["close"]
-    last_vol = completed_candle["volume"]
+    closes = [float(c["close"]) for c in closed_candles]
+    highs = [float(c.get("high", c["close"])) for c in closed_candles]
+    lows = [float(c.get("low", c["close"])) for c in closed_candles]
+    vols = [float(c["volume"]) for c in closed_candles]
+    last_close = closes[-1]
+    last_vol = vols[-1]
 
     regime_sma = None
     if len(closes) >= regime_sma_len:
@@ -607,10 +653,23 @@ def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
         vol_ma_len = bull_vol_ma
 
     active_sma = sum(closes[-active_sma_len:]) / float(active_sma_len)
+    donchian_mid = 0.5 * (max(highs[-active_sma_len:]) + min(lows[-active_sma_len:]))
     prior_vols = vols[-(vol_ma_len + 1):-1]
     prior_vol_avg = sum(prior_vols) / float(vol_ma_len)
     vol_ratio = (last_vol / prior_vol_avg) if prior_vol_avg > 0 else 0.0
     vol_ok = (len(prior_vols) == vol_ma_len) and (prior_vol_avg > 0) and (last_vol >= vol_mult * prior_vol_avg)
+
+    # Strictly causal realized annualized volatility (matching backtester._build_model_d_target_weights)
+    realized_vol_ann = None
+    if len(closes) > vol_lookback:
+        log_rets = []
+        for idx_r in range(len(closes) - vol_lookback, len(closes)):
+            if closes[idx_r - 1] > 0.0 and closes[idx_r] > 0.0:
+                log_rets.append(math.log(closes[idx_r] / closes[idx_r - 1]))
+        if len(log_rets) == vol_lookback:
+            mean_r = sum(log_rets) / float(vol_lookback)
+            var_r = sum((x - mean_r) ** 2 for x in log_rets) / float(vol_lookback - 1)
+            realized_vol_ann = math.sqrt(var_r) * math.sqrt(365.25) * 100.0
 
     is_above = last_close > active_sma
     is_below = last_close < active_sma
@@ -642,18 +701,91 @@ def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
                 else:
                     break
 
-    if prev_pos == "CASH":
-        target_pos = "BTC" if (is_above and vol_ok) else "CASH"
+    donch_below_streak = 0
+    if last_close < donchian_mid:
+        if exit_confirm_days == 1:
+            donch_below_streak = 1
+        else:
+            n_c = len(closes)
+            for idx_back in range(n_c - 1, -1, -1):
+                if idx_back < active_sma_len - 1:
+                    break
+                dm_b = 0.5 * (
+                    max(highs[idx_back - active_sma_len + 1:idx_back + 1])
+                    + min(lows[idx_back - active_sma_len + 1:idx_back + 1])
+                )
+                if closes[idx_back] < dm_b:
+                    donch_below_streak += 1
+                    if donch_below_streak >= exit_confirm_days:
+                        break
+                else:
+                    break
+
+    use_fractional = (trend_kernel == "sma_donchian") or (vol_target_pct > 0.0)
+    if not use_fractional:
+        if prev_pos == "CASH":
+            target_pos = "BTC" if (is_above and vol_ok) else "CASH"
+        else:
+            target_pos = "CASH" if (below_streak >= exit_confirm_days) else "BTC"
+        tranche_active = [1 if target_pos == "BTC" else 0]
+        base_frac = 1.0 if target_pos == "BTC" else 0.0
+        frozen_vol_scalar = 1.0
+        target_weight = base_frac
     else:
-        target_pos = "CASH" if (below_streak >= exit_confirm_days) else "BTC"
+        st = prev_state if isinstance(prev_state, dict) else {}
+        k_cnt = 2 if trend_kernel == "sma_donchian" else 1
+        raw_tr = st.get("tranche_active")
+        if isinstance(raw_tr, list) and len(raw_tr) == k_cnt:
+            tranche_active = [1 if int(x) else 0 for x in raw_tr]
+        else:
+            tranche_active = [1 if prev_pos == "BTC" else 0] * k_cnt
+        prev_active = sum(tranche_active)
+        # Tranche 0: SMA
+        if tranche_active[0]:
+            if below_streak >= exit_confirm_days:
+                tranche_active[0] = 0
+        elif is_above and vol_ok:
+            tranche_active[0] = 1
+        # Tranche 1: Donchian Midpoint (when sma_donchian)
+        if k_cnt == 2:
+            if tranche_active[1]:
+                if donch_below_streak >= exit_confirm_days:
+                    tranche_active[1] = 0
+            elif last_close > donchian_mid and vol_ok:
+                tranche_active[1] = 1
+
+        base_frac = sum(tranche_active) / float(k_cnt)
+        if base_frac <= 0.0:
+            frozen_vol_scalar = 1.0
+            target_weight = 0.0
+        else:
+            if vol_target_pct > 0.0 and realized_vol_ann is not None and realized_vol_ann > 1e-6:
+                cur_scalar = min(1.0, vol_target_pct / realized_vol_ann)
+            else:
+                cur_scalar = 1.0
+            prev_scalar = _safe_float(st.get("frozen_vol_scalar", 1.0), 1.0)
+            if prev_scalar <= 0.0 or prev_scalar > 1.0:
+                prev_scalar = 1.0
+            deadband_frac = rebal_deadband_pct / 100.0
+            if prev_active == 0:
+                frozen_vol_scalar = cur_scalar
+            elif deadband_frac < 1.0 and abs(cur_scalar - prev_scalar) >= deadband_frac * max(0.1, prev_scalar):
+                frozen_vol_scalar = cur_scalar
+            else:
+                frozen_vol_scalar = prev_scalar
+            target_weight = min(1.0, max(0.0, base_frac * frozen_vol_scalar))
+        target_pos = "BTC" if target_weight > 1e-9 else "CASH"
 
     return {
         "strategy": strategy,
         "is_hybrid": is_hybrid,
+        "trend_kernel": trend_kernel,
+        "vol_target_pct": vol_target_pct,
         "completed_candle": completed_candle,
         "last_close": last_close,
         "active_sma_len": active_sma_len,
         "active_sma": active_sma,
+        "donchian_mid": donchian_mid,
         "bull_sma_len": bull_sma_len,
         "bear_sma_len": bear_sma_len,
         "regime_sma_len": regime_sma_len,
@@ -666,10 +798,16 @@ def compute_live_signal_snapshot(closed_candles, config, prev_pos="CASH"):
         "prior_vol_avg": prior_vol_avg,
         "vol_ratio": vol_ratio,
         "vol_ok": vol_ok,
+        "realized_vol_20d": realized_vol_ann,
         "is_above": is_above,
         "is_below": is_below,
         "below_streak": below_streak,
+        "donch_below_streak": donch_below_streak,
         "exit_confirm_days": exit_confirm_days,
+        "tranche_active": tranche_active,
+        "base_frac": base_frac,
+        "vol_scalar": frozen_vol_scalar,
+        "target_weight": target_weight,
         "target_pos": target_pos,
     }
 
@@ -678,6 +816,9 @@ def _strategy_display_name(config, snap=None):
     strategy = config.get("strategy_name", "daily_sma40_hybrid")
     ecd = max(1, _safe_int(config.get("exit_confirm_days", 1), 1))
     ecd_tag = f" · {ecd}일확인" if ecd > 1 else ""
+    tk = str(config.get("trend_kernel", "sma") or "sma").strip().lower()
+    vt = _safe_float(config.get("vol_target_pct", 0.0), 0.0)
+    vol_tag = f" · Vol{vt:g}%" if vt > 0.0 else ""
     if strategy in ("daily_sma40_hybrid", "daily_sma40_volume_c", "daily_sma_hybrid", "model_c"):
         b_sma = config.get("bull_sma_len", 40)
         r_sma = config.get("bear_sma_len", 40)
@@ -686,11 +827,13 @@ def _strategy_display_name(config, snap=None):
         b_l = config.get("bull_vol_ma", 20)
         s_m = config.get("bear_vol_mult", 1.8)
         s_l = config.get("bear_vol_ma", 5)
-        return f"👑 모델 C ({b_sma}/{r_sma}일선 · {reg}일 체제전환 · 불 {b_m}x/{b_l}일 · 약세 {s_m}x/{s_l}일{ecd_tag})"
+        if tk == "sma_donchian":
+            return f"👑 v3 듀얼커널 (SMA+Donch {b_sma}일 · {reg}일 체제 · 불 {b_m}x/{b_l}일 · 약세 {s_m}x/{s_l}일{vol_tag}{ecd_tag})"
+        return f"👑 모델 C ({b_sma}/{r_sma}일선 · {reg}일 체제전환 · 불 {b_m}x/{b_l}일 · 약세 {s_m}x/{s_l}일{vol_tag}{ecd_tag})"
     sma = config.get("strategy_sma", 44)
     vm = config.get("volume_multiplier", 1.2)
     vl = config.get("volume_ma_len", 20)
-    return f"일봉 {sma}일 SMA + 거래량({vm}x, {vl}일{ecd_tag})"
+    return f"일봉 {sma}일 SMA + 거래량({vm}x, {vl}일{vol_tag}{ecd_tag})"
 
 
 def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE_PATH, now_ms=None, candles=None):
@@ -728,8 +871,9 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
 
     if not is_new_daily_close:
         try:
-            snap = compute_live_signal_snapshot(closed, config, prev_pos=state.get("position", "CASH"))
+            snap = compute_live_signal_snapshot(closed, config, prev_pos=state.get("position", "CASH"), prev_state=state)
             state["last_regime_is_bull"] = bool(snap["is_bull"])
+            state["realized_vol_20d"] = snap.get("realized_vol_20d")
         except ValueError as e:
             print(f"Signal computation error: {e}")
             return state, str(e)
@@ -738,7 +882,7 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
         for step_pos, k in enumerate(pending_indices):
             prev_pos = state.get("position", "CASH")
             try:
-                step_snap = compute_live_signal_snapshot(closed[:k + 1], config, prev_pos=prev_pos)
+                step_snap = compute_live_signal_snapshot(closed[:k + 1], config, prev_pos=prev_pos, prev_state=state)
             except ValueError as e:
                 if step_pos == len(pending_indices) - 1 and snap is None:
                     print(f"Signal computation error: {e}")
@@ -752,110 +896,250 @@ def evaluate_signal_and_step(config, state, manual_check=False, state_path=STATE
 
             state["last_evaluated_candle_ms"] = last_evaluated_ms
             target_pos = snap["target_pos"]
+            target_w = float(snap.get("target_weight", 1.0 if target_pos == "BTC" else 0.0))
+            prev_w = float(state.get("target_weight", 1.0 if prev_pos == "BTC" else 0.0))
             state["last_signal"] = target_pos
             state["last_regime_is_bull"] = bool(snap["is_bull"])
+            state["tranche_active"] = list(snap.get("tranche_active", [1 if target_pos == "BTC" else 0]))
+            state["frozen_vol_scalar"] = float(snap.get("vol_scalar", 1.0))
+            state["realized_vol_20d"] = snap.get("realized_vol_20d")
 
-            if prev_pos != target_pos:
-                if target_pos == "BTC":
-                    cash = float(state.get("cash", config.get("initial_seed_usdt", 10000.0)))
-                    buy_fill = step_fill_price * (1.0 + slip_rate)
-                    qty = cash / (buy_fill * (1.0 + fee_rate))
-                    fee = qty * buy_fill * fee_rate
-                    state["cash"] = 0.0
-                    state["btc_qty"] = qty
-                    state["cost_basis"] = cash
-                    state["position"] = "BTC"
-                    state["entry_price"] = buy_fill
-                    state["entry_time_utc"] = datetime.now(timezone.utc).isoformat()
+            use_fractional = (snap.get("trend_kernel") == "sma_donchian") or (float(snap.get("vol_target_pct", 0.0)) > 0.0)
+            if not use_fractional:
+                state["target_weight"] = 1.0 if target_pos == "BTC" else 0.0
+                if prev_pos != target_pos:
+                    if target_pos == "BTC":
+                        cash = float(state.get("cash", config.get("initial_seed_usdt", 10000.0)))
+                        buy_fill = step_fill_price * (1.0 + slip_rate)
+                        qty = cash / (buy_fill * (1.0 + fee_rate))
+                        fee = qty * buy_fill * fee_rate
+                        state["cash"] = 0.0
+                        state["btc_qty"] = qty
+                        state["cost_basis"] = cash
+                        state["position"] = "BTC"
+                        state["entry_price"] = buy_fill
+                        state["entry_time_utc"] = datetime.now(timezone.utc).isoformat()
 
-                    # Canonical Model C Combined rule: if an active 2h dip trade spans across or expires at
-                    # daily BTC buy open (exit_open_ms >= daily_fill_open_ms), promote into trend without selling.
-                    promoted_dip = None
-                    daily_fill_open_ms = int(completed_candle["close_time_ms"]) + 1
-                    open_dip = state.get("open_dip")
-                    if isinstance(open_dip, dict) and _safe_int(open_dip.get("exit_open_ms", 0), 0) >= daily_fill_open_ms:
-                        dip_entry_ref = float(open_dip.get("entry_ref_price") or open_dip.get("entry_fill") or step_fill_price)
-                        handoff_ret_pct = ((step_fill_price / dip_entry_ref) - 1.0) * 100.0 if dip_entry_ref > 0 else 0.0
-                        promoted_dip = {
-                            "status": "PROMOTED_TO_TREND",
-                            "signal_candle_ms": open_dip.get("signal_candle_ms", 0),
-                            "entry_open_ms": open_dip.get("entry_open_ms", 0),
-                            "exit_open_ms": daily_fill_open_ms,
-                            "entry_time": open_dip.get("entry_time_utc", ""),
-                            "exit_time": datetime.fromtimestamp(daily_fill_open_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                            "entry_price": float(open_dip.get("entry_fill", dip_entry_ref)),
-                            "entry_ref_price": dip_entry_ref,
-                            "exit_price": float(step_fill_price),
-                            "exit_ref_price": float(step_fill_price),
-                            "pnl": 0.0,
-                            "pnl_pct": handoff_ret_pct,
-                            "drop_pct_actual": open_dip.get("drop_pct_actual"),
-                            "vol_ratio": open_dip.get("vol_ratio"),
-                            "reason": "모델 C 추세 승계 (매도 없이 전환)",
-                            "exit_alert_sent": True,
+                        # Canonical Model C Combined rule: if an active 2h dip trade spans across or expires at
+                        # daily BTC buy open (exit_open_ms >= daily_fill_open_ms), promote into trend without selling.
+                        promoted_dip = None
+                        daily_fill_open_ms = int(completed_candle["close_time_ms"]) + 1
+                        open_dip = state.get("open_dip")
+                        if isinstance(open_dip, dict) and _safe_int(open_dip.get("exit_open_ms", 0), 0) >= daily_fill_open_ms:
+                            dip_entry_ref = float(open_dip.get("entry_ref_price") or open_dip.get("entry_fill") or step_fill_price)
+                            handoff_ret_pct = ((step_fill_price / dip_entry_ref) - 1.0) * 100.0 if dip_entry_ref > 0 else 0.0
+                            promoted_dip = {
+                                "status": "PROMOTED_TO_TREND",
+                                "signal_candle_ms": open_dip.get("signal_candle_ms", 0),
+                                "entry_open_ms": open_dip.get("entry_open_ms", 0),
+                                "exit_open_ms": daily_fill_open_ms,
+                                "entry_time": open_dip.get("entry_time_utc", ""),
+                                "exit_time": datetime.fromtimestamp(daily_fill_open_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                "entry_price": float(open_dip.get("entry_fill", dip_entry_ref)),
+                                "entry_ref_price": dip_entry_ref,
+                                "exit_price": float(step_fill_price),
+                                "exit_ref_price": float(step_fill_price),
+                                "pnl": 0.0,
+                                "pnl_pct": handoff_ret_pct,
+                                "drop_pct_actual": open_dip.get("drop_pct_actual"),
+                                "vol_ratio": open_dip.get("vol_ratio"),
+                                "reason": "모델 C 추세 승계 (매도 없이 전환)",
+                                "exit_alert_sent": True,
+                            }
+                            state.setdefault("dip_trades", []).append(promoted_dip)
+                            if open_dip.get("cost_basis"):
+                                state["dip_cash"] = float(open_dip["cost_basis"])
+                            state["open_dip"] = None
+
+                        trade_executed = True
+                        trade_info = {
+                            "action": "매수 (BUY)",
+                            "price": buy_fill,
+                            "reference_price": step_fill_price,
+                            "qty": qty,
+                            "fee": fee,
+                            "regime": snap["regime_label"],
+                            "vol_ratio": snap["vol_ratio"],
+                            "promoted_dip": promoted_dip,
+                            "reason": (
+                                f"{snap['active_sma_len']}일선 돌파 & 거래량 {snap['vol_ratio']:.2f}배 "
+                                f"(>= {snap['vol_mult']}배, {snap['regime_label']})"
+                            ),
+                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                         }
-                        state.setdefault("dip_trades", []).append(promoted_dip)
-                        if open_dip.get("cost_basis"):
-                            state["dip_cash"] = float(open_dip["cost_basis"])
-                        state["open_dip"] = None
+                        state["trades"].append(trade_info)
+                    else:
+                        qty = float(state.get("btc_qty", 0.0))
+                        sell_fill = step_fill_price * (1.0 - slip_rate)
+                        gross_cash = qty * sell_fill
+                        fee = gross_cash * fee_rate
+                        net_cash = gross_cash - fee
+                        entry_p = float(state.get("entry_price", 0.0))
+                        cost_basis = float(state.get("cost_basis") or (qty * entry_p * (1.0 + fee_rate)))
+                        pnl = net_cash - cost_basis
+                        pnl_pct = (pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
 
-                    trade_executed = True
-                    trade_info = {
-                        "action": "매수 (BUY)",
-                        "price": buy_fill,
-                        "reference_price": step_fill_price,
-                        "qty": qty,
-                        "fee": fee,
-                        "regime": snap["regime_label"],
-                        "vol_ratio": snap["vol_ratio"],
-                        "promoted_dip": promoted_dip,
-                        "reason": (
-                            f"{snap['active_sma_len']}일선 돌파 & 거래량 {snap['vol_ratio']:.2f}배 "
-                            f"(>= {snap['vol_mult']}배, {snap['regime_label']})"
-                        ),
-                        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    }
-                    state["trades"].append(trade_info)
-                else:
-                    qty = float(state.get("btc_qty", 0.0))
-                    sell_fill = step_fill_price * (1.0 - slip_rate)
-                    gross_cash = qty * sell_fill
-                    fee = gross_cash * fee_rate
-                    net_cash = gross_cash - fee
-                    entry_p = float(state.get("entry_price", 0.0))
-                    cost_basis = float(state.get("cost_basis") or (qty * entry_p * (1.0 + fee_rate)))
-                    pnl = net_cash - cost_basis
-                    pnl_pct = (pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+                        state["cash"] = net_cash
+                        state["btc_qty"] = 0.0
+                        state["cost_basis"] = 0.0
+                        state["position"] = "CASH"
+                        state["entry_price"] = 0.0
+                        state["entry_time_utc"] = ""
+                        trade_executed = True
+                        trade_info = {
+                            "action": "매도 (SELL)",
+                            "price": sell_fill,
+                            "reference_price": step_fill_price,
+                            "qty": qty,
+                            "fee": fee,
+                            "pnl": pnl,
+                            "pnl_pct": pnl_pct,
+                            "regime": snap["regime_label"],
+                            "vol_ratio": snap["vol_ratio"],
+                            "reason": (
+                                f"{snap['active_sma_len']}일선 {snap.get('exit_confirm_days', 1)}일 연속 하향 이탈 청산"
+                                if snap.get("exit_confirm_days", 1) > 1
+                                else f"{snap['active_sma_len']}일선 하향 이탈 청산"
+                            ),
+                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        }
+                        state["trades"].append(trade_info)
 
-                    state["cash"] = net_cash
-                    state["btc_qty"] = 0.0
-                    state["cost_basis"] = 0.0
-                    state["position"] = "CASH"
-                    state["entry_price"] = 0.0
-                    state["entry_time_utc"] = ""
-                    trade_executed = True
-                    trade_info = {
-                        "action": "매도 (SELL)",
-                        "price": sell_fill,
-                        "reference_price": step_fill_price,
-                        "qty": qty,
-                        "fee": fee,
-                        "pnl": pnl,
-                        "pnl_pct": pnl_pct,
-                        "regime": snap["regime_label"],
-                        "vol_ratio": snap["vol_ratio"],
-                        "reason": (
-                            f"{snap['active_sma_len']}일선 {snap.get('exit_confirm_days', 1)}일 연속 하향 이탈 청산"
-                            if snap.get("exit_confirm_days", 1) > 1
-                            else f"{snap['active_sma_len']}일선 하향 이탈 청산"
-                        ),
-                        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    }
-                    state["trades"].append(trade_info)
-
-                save_state(state, state_path=state_path)
-                msg = format_trade_alert(config, state, trade_info, snap)
-                send_telegram_message(token, chat_id, msg)
+                    save_state(state, state_path=state_path)
+                    msg = format_trade_alert(config, state, trade_info, snap)
+                    send_telegram_message(token, chat_id, msg)
+            else:
+                # Fractional target-weight rebalancing (1:1 parity with simulation.simulate_target_weights)
+                state["target_weight"] = target_w
+                if abs(target_w - prev_w) > 1e-6:
+                    cash = float(state.get("cash", config.get("initial_seed_usdt", 10000.0)))
+                    cur_qty = float(state.get("btc_qty", 0.0))
+                    eq_now = cash + cur_qty * step_fill_price
+                    desired_val = eq_now * target_w
+                    cur_val = cur_qty * step_fill_price
+                    diff_val = desired_val - cur_val
+                    trade_info = None
+                    if target_w <= 1e-9:
+                        if cur_qty > 0.0:
+                            sell_fill = step_fill_price * (1.0 - slip_rate)
+                            gross_cash = cur_qty * sell_fill
+                            fee = gross_cash * fee_rate
+                            net_cash = gross_cash - fee
+                            cost_basis = float(state.get("cost_basis") or (cur_qty * float(state.get("entry_price", 0.0)) * (1.0 + fee_rate)))
+                            pnl = net_cash - cost_basis
+                            pnl_pct = (pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+                            state["cash"] = cash + net_cash
+                            state["btc_qty"] = 0.0
+                            state["cost_basis"] = 0.0
+                            state["position"] = "CASH"
+                            state["entry_price"] = 0.0
+                            state["entry_time_utc"] = ""
+                            trade_info = {
+                                "action": "매도 (SELL)",
+                                "price": sell_fill,
+                                "reference_price": step_fill_price,
+                                "qty": cur_qty,
+                                "fee": fee,
+                                "pnl": pnl,
+                                "pnl_pct": pnl_pct,
+                                "target_weight": 0.0,
+                                "regime": snap["regime_label"],
+                                "vol_ratio": snap["vol_ratio"],
+                                "reason": f"목표 비중 {prev_w*100:.0f}% → 0% 전량 청산 ({snap.get('exit_confirm_days', 1)}일 확인)",
+                                "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                            }
+                    elif diff_val > 1e-6 and cash > 1e-6:
+                        buy_budget = min(cash, diff_val)
+                        buy_fill = step_fill_price * (1.0 + slip_rate)
+                        add_qty = buy_budget / (buy_fill * (1.0 + fee_rate))
+                        fee = add_qty * buy_fill * fee_rate
+                        new_qty = cur_qty + add_qty
+                        new_basis = float(state.get("cost_basis", 0.0)) + buy_budget
+                        state["cash"] = max(0.0, cash - buy_budget)
+                        state["btc_qty"] = new_qty
+                        state["cost_basis"] = new_basis
+                        state["position"] = "BTC"
+                        state["entry_price"] = (new_basis / (new_qty * (1.0 + fee_rate))) if new_qty > 0 else buy_fill
+                        if prev_pos == "CASH":
+                            state["entry_time_utc"] = datetime.now(timezone.utc).isoformat()
+                        promoted_dip = None
+                        daily_fill_open_ms = int(completed_candle["close_time_ms"]) + 1
+                        open_dip = state.get("open_dip")
+                        if prev_pos == "CASH" and isinstance(open_dip, dict) and _safe_int(open_dip.get("exit_open_ms", 0), 0) >= daily_fill_open_ms:
+                            dip_entry_ref = float(open_dip.get("entry_ref_price") or open_dip.get("entry_fill") or step_fill_price)
+                            handoff_ret_pct = ((step_fill_price / dip_entry_ref) - 1.0) * 100.0 if dip_entry_ref > 0 else 0.0
+                            promoted_dip = {
+                                "status": "PROMOTED_TO_TREND",
+                                "signal_candle_ms": open_dip.get("signal_candle_ms", 0),
+                                "entry_open_ms": open_dip.get("entry_open_ms", 0),
+                                "exit_open_ms": daily_fill_open_ms,
+                                "entry_time": open_dip.get("entry_time_utc", ""),
+                                "exit_time": datetime.fromtimestamp(daily_fill_open_ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                "entry_price": float(open_dip.get("entry_fill", dip_entry_ref)),
+                                "entry_ref_price": dip_entry_ref,
+                                "exit_price": float(step_fill_price),
+                                "exit_ref_price": float(step_fill_price),
+                                "pnl": 0.0,
+                                "pnl_pct": handoff_ret_pct,
+                                "drop_pct_actual": open_dip.get("drop_pct_actual"),
+                                "vol_ratio": open_dip.get("vol_ratio"),
+                                "reason": "v3 추세 승계 (매도 없이 전환)",
+                                "exit_alert_sent": True,
+                            }
+                            state.setdefault("dip_trades", []).append(promoted_dip)
+                            if open_dip.get("cost_basis"):
+                                state["dip_cash"] = float(open_dip["cost_basis"])
+                            state["open_dip"] = None
+                        rv_txt = f" · 20d변동성 {snap['realized_vol_20d']:.0f}%" if snap.get("realized_vol_20d") is not None else ""
+                        trade_info = {
+                            "action": "매수 (BUY)" if prev_pos == "CASH" else "비중확대 (REBAL BUY)",
+                            "price": buy_fill,
+                            "reference_price": step_fill_price,
+                            "qty": add_qty,
+                            "fee": fee,
+                            "target_weight": target_w,
+                            "promoted_dip": promoted_dip,
+                            "regime": snap["regime_label"],
+                            "vol_ratio": snap["vol_ratio"],
+                            "reason": f"목표 비중 {prev_w*100:.0f}% → {target_w*100:.0f}%{rv_txt}",
+                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        }
+                    elif diff_val < -1e-6 and cur_qty > 0.0:
+                        sell_qty = min(cur_qty, (-diff_val) / step_fill_price)
+                        sell_fill = step_fill_price * (1.0 - slip_rate)
+                        gross_cash = sell_qty * sell_fill
+                        fee = gross_cash * fee_rate
+                        net_cash = gross_cash - fee
+                        frac_sold = sell_qty / cur_qty if cur_qty > 0 else 1.0
+                        rem_basis = float(state.get("cost_basis", 0.0))
+                        sold_basis = rem_basis * frac_sold
+                        pnl = net_cash - sold_basis
+                        pnl_pct = (pnl / sold_basis * 100.0) if sold_basis > 0 else 0.0
+                        state["cash"] = cash + net_cash
+                        state["btc_qty"] = max(0.0, cur_qty - sell_qty)
+                        state["cost_basis"] = max(0.0, rem_basis - sold_basis)
+                        state["position"] = "BTC" if state["btc_qty"] > 1e-12 else "CASH"
+                        rv_txt = f" · 20d변동성 {snap['realized_vol_20d']:.0f}%" if snap.get("realized_vol_20d") is not None else ""
+                        trade_info = {
+                            "action": "비중축소 (REBAL TRIM)",
+                            "price": sell_fill,
+                            "reference_price": step_fill_price,
+                            "qty": sell_qty,
+                            "fee": fee,
+                            "pnl": pnl,
+                            "pnl_pct": pnl_pct,
+                            "target_weight": target_w,
+                            "regime": snap["regime_label"],
+                            "vol_ratio": snap["vol_ratio"],
+                            "reason": f"목표 비중 {prev_w*100:.0f}% → {target_w*100:.0f}%{rv_txt}",
+                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        }
+                    if trade_info is not None:
+                        trade_executed = True
+                        state["trades"].append(trade_info)
+                        save_state(state, state_path=state_path)
+                        msg = format_trade_alert(config, state, trade_info, snap)
+                        send_telegram_message(token, chat_id, msg)
 
             step_date_str = datetime.fromtimestamp(last_evaluated_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
             _record_oos_daily_point(state, step_date_str, float(snap["last_close"]))
@@ -894,18 +1178,20 @@ def describe_position_action(state, snap, ref_price):
     """Return shared (badge, action_guide, cur_equity, total_ret, vol_mark) for briefings/status."""
     pos = state.get("position", "CASH")
     initial_seed = float(state.get("initial_seed", 10000.0))
-    cur_equity = float(state["cash"]) if pos == "CASH" else float(state["btc_qty"]) * float(ref_price)
+    cur_equity = float(state.get("cash", 0.0)) + float(state.get("btc_qty", 0.0)) * float(ref_price)
     total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
     sma = snap["active_sma"]
     sma_len = snap["active_sma_len"]
     has_dip = isinstance(state.get("open_dip"), dict)
+    tw_pct = float(state.get("target_weight", 1.0 if pos == "BTC" else 0.0)) * 100.0
+    v_str = f" · 20d변동성 {snap['realized_vol_20d']:.0f}%" if snap.get("realized_vol_20d") is not None else ""
 
     if pos == "BTC":
-        badge = "🟢 [매수 유지 · 보유]"
-        action_guide = f"<b>관망(홀딩)</b> · {sma_len}일선(${sma:,.0f}) 이탈 시 매도"
+        badge = f"🟢 [매수 유지 · BTC {tw_pct:.0f}%]" if tw_pct < 99.5 else "🟢 [매수 유지 · 보유]"
+        action_guide = f"<b>관망(홀딩)</b> · {sma_len}일선(${sma:,.0f}) 이탈 시 매도{v_str}"
     elif has_dip:
         badge = "🟢 [단타 보유 · 추세 관망]"
-        action_guide = f"2h 단타 진행 중 · 일봉 추세 <b>관망</b> (${sma:,.0f} 돌파+거래량 {snap['vol_mult']}배 대기)"
+        action_guide = f"급락 단타 진행 중 · 일봉 추세 <b>관망</b> (${sma:,.0f} 돌파+거래량 {snap['vol_mult']}배 대기)"
     elif snap["is_above"]:
         badge = "🟡 [관망 · 현금 대기]"
         action_guide = f"<b>관망</b> · {sma_len}일선 위지만 거래량 부족({snap['vol_ratio']:.2f}/{snap['vol_mult']}배)"
@@ -919,23 +1205,30 @@ def describe_position_action(state, snap, ref_price):
 
 def format_trade_alert(config, state, trade, snap):
     action = trade["action"]
-    is_buy = "매수" in action
-    header = "🟢 [매수] BTC 진입 완료" if is_buy else "🔴 [매도] 전량 현금화"
-    cur_equity = float(state["cash"]) if state["position"] == "CASH" else float(state["btc_qty"]) * trade["price"]
+    is_buy = ("매수" in action) or ("확대" in action)
+    if "확대" in action:
+        header = "🔵 [비중 확대] BTC 추가 매수"
+    elif "축소" in action:
+        header = "🟠 [비중 축소] 변동성·커널 리밸런싱"
+    else:
+        header = "🟢 [매수] BTC 진입 완료" if is_buy else "🔴 [매도] 전량 현금화"
+    cur_equity = float(state.get("cash", 0.0)) + float(state.get("btc_qty", 0.0)) * trade["price"]
     initial_seed = float(state.get("initial_seed", 10000.0))
     total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
     promoted = trade.get("promoted_dip")
     promo_line = ""
     if isinstance(promoted, dict):
         promo_line = (
-            f"\n• <b>단타 추세 승계:</b> 기존 2h 단타(${promoted['entry_ref_price']:,.0f} · "
+            f"\n• <b>단타 추세 승계:</b> 기존 단타(${promoted['entry_ref_price']:,.0f} · "
             f"{promoted['pnl_pct']:+.2f}%) 매도 없이 홀딩 연결"
         )
 
-    pos_short = "BTC 100% 보유" if state["position"] == "BTC" else "USDT 100% 관망"
+    tw_pct = float(state.get("target_weight", 1.0 if state["position"] == "BTC" else 0.0)) * 100.0
+    pos_short = f"BTC {tw_pct:.0f}% / 현금 {max(0.0, 100.0 - tw_pct):.0f}%" if state["position"] == "BTC" else "USDT 100% 관망"
+    reason_line = trade.get("reason") or f"{snap['active_sma_len']}일선(${snap['active_sma']:,.0f}) {'돌파' if is_buy else '이탈'} · 거래량 {snap['vol_ratio']:.2f}배"
     return f"""<b>{header}</b>
 • <b>체결:</b> ${trade['price']:,.2f} ({snap['regime_label']})
-• <b>근거:</b> {snap['active_sma_len']}일선(${snap['active_sma']:,.0f}) {'돌파' if is_buy else '이탈'} · 거래량 {snap['vol_ratio']:.2f}배{promo_line}
+• <b>근거:</b> {reason_line}{promo_line}
 • <b>계좌:</b> {pos_short} · ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)
 • <b>시각:</b> {trade['time']}"""
 
@@ -945,9 +1238,16 @@ def format_daily_briefing(config, state, price, date_str, snap):
     sma_len = snap["active_sma_len"]
     diff_pct = (snap["last_close"] / sma - 1.0) * 100.0
     badge, action_guide, cur_equity, total_ret, vol_mark = describe_position_action(state, snap, price)
+    extra_v3 = ""
+    if snap.get("trend_kernel") == "sma_donchian" or float(snap.get("vol_target_pct", 0.0)) > 0.0:
+        dm = snap.get("donchian_mid", sma)
+        rv = snap.get("realized_vol_20d")
+        rv_s = f"{rv:.1f}%" if rv is not None else "N/A"
+        tw_s = f"{float(snap.get('target_weight', 0.0))*100:.0f}%"
+        extra_v3 = f"\n• <b>v3 지표:</b> 돈치안{sma_len}중앙 ${dm:,.0f} · 20d변동성 {rv_s} · 목표비중 <b>{tw_s}</b>"
     return f"""<b>{badge} 일봉 마감 ({date_str})</b>
 • <b>행동:</b> {action_guide}
-• <b>종가/기준선:</b> ${snap['last_close']:,.0f} ({sma_len}일선 <b>{diff_pct:+.2f}%</b> · {snap['regime_label']})
+• <b>종가/기준선:</b> ${snap['last_close']:,.0f} ({sma_len}일선 <b>{diff_pct:+.2f}%</b> · {snap['regime_label']}){extra_v3}
 • <b>거래량:</b> {vol_mark} {snap['vol_ratio']:.2f}배 (기준 {snap['vol_mult']}배)
 • <b>잔고:</b> ${cur_equity:,.0f} (<b>{total_ret:+.2f}%</b>)"""
 
@@ -1347,6 +1647,8 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
     """Send 2h dip entry/exit alerts, settle 2h paper trades, and enforce CASH-only gating."""
     enabled = config.get("dip_alert_enabled", True)
     pos = state.get("position", "CASH")
+    tw_cur = _safe_float(state.get("target_weight", 1.0 if pos == "BTC" else 0.0), 1.0 if pos == "BTC" else 0.0)
+    is_full_btc = (pos != "CASH") and (tw_cur >= 0.99)
     cash_only = config.get("dip_alert_cash_only", True)
     has_open_dip = isinstance(state.get("open_dip"), dict)
     has_unsent_exit = any(
@@ -1357,7 +1659,7 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
     if not enabled and not has_open_dip and not has_unsent_exit:
         return {"checked": False, "alert_sent": False, "skipped_reason": "disabled"}
 
-    if enabled and cash_only and pos != "CASH" and not has_open_dip and not has_unsent_exit:
+    if enabled and cash_only and is_full_btc and not has_open_dip and not has_unsent_exit:
         return {"checked": False, "alert_sent": False, "skipped_reason": "in_btc_position", "position": pos}
 
     token = config.get("bot_token")
@@ -1395,7 +1697,7 @@ def check_dip_alert(config, state, state_path=STATE_PATH, now_ms=None, candles_5
             "exit_retried": exit_retried,
         }
 
-    if cash_only and pos != "CASH":
+    if cash_only and is_full_btc:
         return {
             "checked": False,
             "alert_sent": False,
@@ -1766,7 +2068,7 @@ def get_current_status_text(config, state):
 
     prev_pos = state.get("position", "CASH")
     try:
-        snap = compute_live_signal_snapshot(closed, config, prev_pos=prev_pos)
+        snap = compute_live_signal_snapshot(closed, config, prev_pos=prev_pos, prev_state=state)
     except ValueError as e:
         return f"⚠️ {e}"
 
@@ -1781,9 +2083,10 @@ def get_current_status_text(config, state):
 
     pos = prev_pos
     initial_seed = _safe_float(state.get("initial_seed", 10000.0), 10000.0)
-    cur_equity = _safe_float(state.get("cash", 0.0), 0.0) if pos == "CASH" else _safe_float(state.get("btc_qty", 0.0), 0.0) * current_price
+    cur_equity = _safe_float(state.get("cash", 0.0), 0.0) + _safe_float(state.get("btc_qty", 0.0), 0.0) * current_price
     total_ret = (cur_equity / initial_seed - 1.0) * 100.0 if initial_seed > 0 else 0.0
     vol_ok_txt = "✅충족" if snap["vol_ok"] else "미달"
+    tw_pct = _safe_float(state.get("target_weight", 1.0 if pos == "BTC" else 0.0), 1.0 if pos == "BTC" else 0.0) * 100.0
 
     dip_lb_h = max(1, _safe_int(config.get("dip_alert_lookback_bars", 24), 24)) * 5 / 60.0
     dip_drop = _safe_float(config.get("dip_alert_drop_pct", 4.5), 4.5)
@@ -1796,13 +2099,13 @@ def get_current_status_text(config, state):
         ex_ms = _safe_int(open_dip.get("exit_open_ms", 0), 0)
         ex_str = datetime.fromtimestamp(ex_ms / 1000.0, tz=timezone.utc).strftime('%H:%M UTC') if ex_ms > 0 else "시간 미정"
         dip_status_str = f"단타 보유 중 (청산 {ex_str})"
-    elif config.get("dip_alert_cash_only", True) and pos != "CASH":
-        dip_status_str = "정지 (BTC 보유 중)"
+    elif config.get("dip_alert_cash_only", True) and pos != "CASH" and tw_pct >= 99.0:
+        dip_status_str = "정지 (BTC 100% 보유 중)"
     else:
         dip_status_str = f"감시 중 ({dip_spec})"
 
     if pos == "BTC":
-        header = "🟢 [매수 유지 · BTC 보유 중]"
+        header = f"🟢 [매수 유지 · BTC {tw_pct:.0f}% 보유 중]" if tw_pct < 99.5 else "🟢 [매수 유지 · BTC 보유 중]"
         next_cond = f"{sma_len}일선(${sma:,.0f}) 이탈 시 <b>매도</b>"
     elif isinstance(open_dip, dict):
         header = "🟢 [단타 매수 보유] · 추세는 관망"
@@ -1816,8 +2119,14 @@ def get_current_status_text(config, state):
     if dip_summary["closed_count"] > 0 or dip_summary["promoted_count"] > 0:
         dip_ledger_str = f" · {dip_summary['wins']}승{dip_summary['losses']}패({dip_summary['total_ret_pct']:+.1f}%)"
 
+    v3_line = ""
+    if snap.get("trend_kernel") == "sma_donchian" or float(snap.get("vol_target_pct", 0.0)) > 0.0:
+        rv = snap.get("realized_vol_20d")
+        rv_s = f"{rv:.1f}%" if rv is not None else "N/A"
+        v3_line = f"\n• <b>v3 듀얼/변동성:</b> 돈치안{sma_len}중앙 ${snap.get('donchian_mid', sma):,.0f} · 20d변동성 {rv_s} (목표 {snap.get('vol_target_pct', 0):g}%)"
+
     return f"""<b>{header}</b>
-• <b>현재가 / {sma_len}일선:</b> ${current_price:,.2f} (<b>{diff_pct:+.2f}%</b> · {snap['regime_label']})
+• <b>현재가 / {sma_len}일선:</b> ${current_price:,.2f} (<b>{diff_pct:+.2f}%</b> · {snap['regime_label']}){v3_line}
 • <b>거래량:</b> {snap['vol_ratio']:.2f}배 / 기준 {snap['vol_mult']}배 ({vol_ok_txt})
 • <b>다음 기준:</b> {next_cond}
 • <b>단타 감시:</b> {dip_status_str}{dip_ledger_str}
@@ -1830,7 +2139,7 @@ def _record_oos_daily_point(state, date_str, btc_price):
     if p <= 0.0 or not date_str:
         return
     pos = state.get("position", "CASH")
-    cur_eq = _safe_float(state.get("cash", 0.0), 0.0) if pos == "CASH" else _safe_float(state.get("btc_qty", 0.0), 0.0) * p
+    cur_eq = _safe_float(state.get("cash", 0.0), 0.0) + _safe_float(state.get("btc_qty", 0.0), 0.0) * p
     if not state.get("oos_start_utc"):
         state["oos_start_utc"] = f"{date_str}T00:00:00Z"
     if _safe_float(state.get("oos_start_btc_price", 0.0), 0.0) <= 0.0:
@@ -1860,9 +2169,9 @@ def compute_live_oos_scorecard(config, state, current_btc_price=None):
         (state.get("oos_equity_history") or [{}])[-1].get("btc_price") if state.get("oos_equity_history") else None,
         state.get("oos_start_btc_price"),
     )
-    cur_eq = _safe_float(state.get("cash", seed), seed) if pos == "CASH" else (
-        _safe_float(state.get("btc_qty", 0.0), 0.0) * cur_p if cur_p > 0 else _safe_float(state.get("cost_basis", seed), seed)
-    )
+    cash_now = _safe_float(state.get("cash", seed if pos == "CASH" else 0.0), seed if pos == "CASH" else 0.0)
+    btc_now = _safe_float(state.get("btc_qty", 0.0), 0.0)
+    cur_eq = (cash_now + btc_now * cur_p) if (cur_p > 0 or pos == "CASH") else (cash_now + _safe_float(state.get("cost_basis", seed), seed))
     model_c_ret = ((cur_eq / seed) - 1.0) * 100.0 if seed > 0 else 0.0
 
     hist = state.get("oos_equity_history") if isinstance(state.get("oos_equity_history"), list) else []
