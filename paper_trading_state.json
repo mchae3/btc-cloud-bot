@@ -9,7 +9,7 @@
   "trades": [],
   "last_signal": "CASH",
   "last_touch_alerts": {},
-  "last_morning_report_date": "2026-11-18",
+  "last_morning_report_date": "2026-11-19",
   "cost_basis": 0.0,
   "last_dip_alert_ts": 0.0,
   "last_dip_alert_candle_ms": 0,
@@ -17,5 +17,11 @@
   "dip_initial_seed": 10000.0,
   "dip_cash": 10000.0,
   "open_dip": null,
-  "dip_trades": []
+  "dip_trades": [],
+  "last_regime_is_bull": false,
+  "oos_start_utc": "",
+  "oos_start_btc_price": 0.0,
+  "oos_start_equity": 10000.0,
+  "oos_equity_history": [],
+  "realized_vol_20d": 48.465547669956436
 }
