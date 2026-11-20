@@ -5,7 +5,7 @@
   "position": "CASH",
   "entry_price": 0.0,
   "entry_time_utc": "",
-  "last_evaluated_candle_ms": 1794960000000,
+  "last_evaluated_candle_ms": 1795046400000,
   "trades": [],
   "last_signal": "CASH",
   "last_touch_alerts": {},
@@ -19,9 +19,22 @@
   "open_dip": null,
   "dip_trades": [],
   "last_regime_is_bull": false,
-  "oos_start_utc": "",
-  "oos_start_btc_price": 0.0,
+  "oos_start_utc": "2026-11-19T00:00:00Z",
+  "oos_start_btc_price": 61986.73,
   "oos_start_equity": 10000.0,
-  "oos_equity_history": [],
-  "realized_vol_20d": 48.465547669956436
+  "oos_equity_history": [
+    {
+      "date": "2026-11-19",
+      "equity": 10000.0,
+      "btc_price": 61986.73,
+      "position": "CASH"
+    }
+  ],
+  "realized_vol_20d": 48.532012469564215,
+  "tranche_active": [
+    0,
+    0
+  ],
+  "frozen_vol_scalar": 1.0,
+  "target_weight": 0.0
 }
