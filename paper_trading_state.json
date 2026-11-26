@@ -5,7 +5,7 @@
   "position": "CASH",
   "entry_price": 0.0,
   "entry_time_utc": "",
-  "last_evaluated_candle_ms": 1795478400000,
+  "last_evaluated_candle_ms": 1795564800000,
   "trades": [],
   "last_signal": "CASH",
   "last_touch_alerts": {},
@@ -58,9 +58,15 @@
       "equity": 10000.0,
       "btc_price": 59832.0,
       "position": "CASH"
+    },
+    {
+      "date": "2026-11-25",
+      "equity": 10000.0,
+      "btc_price": 60458.01,
+      "position": "CASH"
     }
   ],
-  "realized_vol_20d": 48.19768063605452,
+  "realized_vol_20d": 45.5005549171273,
   "tranche_active": [
     0,
     0
